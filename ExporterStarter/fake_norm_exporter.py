@@ -5,23 +5,25 @@ from prometheus_client import PROCESS_COLLECTOR, PLATFORM_COLLECTOR, GC_COLLECTO
 import argparse
 import random
 import sys
+import time
 
+batch_size = 1
 
 class CustomCollector(Collector):
 
-    def __init__(self, num_machines, scale, start):
+    def __init__(self, num_machines, scale, machine_id_start):
         self.num_machines = num_machines
         self.scale = scale
-        self.start = start
+        self.machine_id_start = machine_id_start
 
     def collect(self):
 
         fake_metric = GaugeMetricFamily(
             "fake_machine_metric",
-            "fake_machine_normal_distibution",
+            "Generating fake machine time series data with normal distibution",
             labels=["machineid"],
         )
-        for i in range(self.start, self.start + self.num_machines):
+        for i in range(self.machine_id_start, self.machine_id_start + self.num_machines):
             value = -1
             while value < 0:
                 value = random.gauss(0.5, 0.2) * self.scale
@@ -34,7 +36,7 @@ class CustomCollector(Collector):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process metric data")
     parser.add_argument("--port", type=int, help="port to start on")
-    parser.add_argument("--instancestart", type=int, help="instance_id to start on ")
+    parser.add_argument("--instancestart", type=int, help="machine_id to start on ")
     parser.add_argument(
         "--valuescale", type=int, help="range of report metric 0-valuescale"
     )
@@ -43,9 +45,8 @@ if __name__ == "__main__":
         print("Missing argument --port, or --valuescale or --instancestart")
         sys.exit(0)
     print("Starting Server ...")
-    NUMBER_TIMESERIES = 500
     metric_collector = CustomCollector(
-        NUMBER_TIMESERIES, args.valuescale, args.instancestart
+        batch_size, args.valuescale, args.instancestart
     )
     REGISTRY.unregister(PROCESS_COLLECTOR)
     REGISTRY.unregister(PLATFORM_COLLECTOR)
@@ -54,4 +55,4 @@ if __name__ == "__main__":
     start_http_server(port=args.port)
     print("Server Started")
     while True:
-        a = 5
+        time.sleep(1)

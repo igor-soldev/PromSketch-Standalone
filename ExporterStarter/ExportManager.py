@@ -5,6 +5,8 @@ import subprocess
 
 ports = []
 processes = []
+num_targets = 3
+ts_batch_size = 1
 START_PORT = 8000
 
 
@@ -27,39 +29,47 @@ def create_ports(targets):
         ports.append(port)
 
 
-def start_subprocesses(config):
-    for port in ports:
-        starting_val = (port - START_PORT) * 500
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "fake_norm_exporter.py",
-                f"--port={str(port)}",
-                f"--valuescale=10",
-                f"--instancestart={str(starting_val)}",
-            ]
-        )
-        processes.append(process)
+def start_prometheus(config):
     process = subprocess.Popen(
         [
-            "./prometheus",
+            "/users/zz_y/prometheus/prometheus",
             f"--config.file={config}",
         ]
     )
     processes.append(process)
 
 
+def start_fake_exporters():
+    for port in ports:
+        starting_val = (port - START_PORT) * ts_batch_size
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "fake_norm_exporter.py",
+                f"--port={str(port)}",
+                f"--valuescale=10000",
+                f"--instancestart={str(starting_val)}",
+            ]
+        )
+        processes.append(process)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="process config file")
+    parser = argparse.ArgumentParser(description="process Prometheus config file")
     parser.add_argument("--config", type=str, help="config")
-    parser.add_argument("--targets", type=int, help="number of targets")
+    parser.add_argument("--timeseries", type=int, help="number of timeseries to generate")
+    parser.add_argument("--targets", type=int, help="number of fake exporter targets")
     args = parser.parse_args()
-    if args.config is None or args.targets is None:
-        print("Missing Config or number of targets, --targets=int --config=str ")
+    
+    if args.config is None:
+        print("Missing Prometheus configuration file, --config=str ")
         sys.exit(0)
 
-    config_file = args.config
-    targets = args.targets
-    create_ports(targets)
+    config_file = args.config    
+    num_targets = args.targets
+    ts_batch_size = int(args.timeseries / num_targets)
+    
+    create_ports(num_targets)
     define_targets(config_file)
-    start_subprocesses(config_file)
+    
+    start_prometheus(config_file)
+    start_fake_exporters()

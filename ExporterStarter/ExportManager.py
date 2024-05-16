@@ -69,7 +69,7 @@ def start_fake_exporters(ts_batch_size):
         processes.append(process)
 
 def start_evaluation_tool(num_targets, window_size, query_type, num_timeseries):
-    process = subprocess.Popen(
+    process = subprocess.call(
         [
             sys.executable,
             "../EvaluationTools/EvalData.py",

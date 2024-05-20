@@ -2,4 +2,4 @@ groups:
   - name: fake_metric_10_samples
     rules:
       - record: fake_metric_sum10
-        expr: sum_over_time(fake_machine_metric[10s])
+        expr: sum_over_time(fake_machine_metric[1s])

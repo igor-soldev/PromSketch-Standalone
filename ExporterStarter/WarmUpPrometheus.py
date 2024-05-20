@@ -83,6 +83,9 @@ def start_evaluation_tool(num_targets, window_size, query_type, num_timeseries, 
     print("started evaluation tool!")
     processes.append(process)
 
+def stop_prometheus():
+    os.system("pkill -9 prometheus")
+
 if __name__ == "__main__":
 
     os.system("pkill -9 prometheus")
@@ -115,4 +118,5 @@ if __name__ == "__main__":
     start_prometheus(config_file)
     start_fake_exporters(ts_batch_size)
     time.sleep(3600) # warm up with the largest possible number of timeseries 
+    stop_prometheus()
 #    start_evaluation_tool(num_targets, window_size, query_type, args.timeseries, args.waiteval)

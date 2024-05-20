@@ -46,7 +46,7 @@ def create_ports(num_targets):
 def start_prometheus(config):
     process = subprocess.Popen(
         [
-            "/users/zz_y/prometheus/prometheus",
+            "/users/zz_y/prometheus-sketch-VLDB/prometheus-extended/prometheus/prometheus",
             f"--config.file={config}",
         ]
     )
@@ -115,4 +115,4 @@ if __name__ == "__main__":
     start_prometheus(config_file)
     start_fake_exporters(ts_batch_size)
     time.sleep(window_size * 0.2 * 2)
-    start_evaluation_tool(num_targets, window_size, query_type, args.timeseries, args.waiteval)
+#    start_evaluation_tool(num_targets, window_size, query_type, args.timeseries, args.waiteval)

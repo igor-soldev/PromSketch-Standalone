@@ -46,7 +46,7 @@ def create_ports(num_targets):
 def start_prometheus(config):
     process = subprocess.Popen(
         [
-            "/users/zz_y/prometheus-sketch-VLDB/prometheus-extended/prometheus/prometheus",
+            "/mydata/prometheus-sketch-VLDB/prometheus-extended/prometheus/prometheus",
             f"--config.file={config}",
         ]
     )

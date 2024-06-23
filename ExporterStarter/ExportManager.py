@@ -132,9 +132,8 @@ if __name__ == "__main__":
 
     create_ports(num_targets)
     define_targets(config_file, window_size, query_type)
-
-    start_victoriametrics(config_file, query_type, window_size, args.timeseries)
     start_fake_exporters(ts_batch_size)
+    start_victoriametrics(config_file, query_type, window_size, args.timeseries)
     start_vmalert(query_type=query_type, window_size=window_size)
     time.sleep(window_size * 0.1 * 1.5)
     start_evaluation_tool(

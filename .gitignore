@@ -1,4 +1,8 @@
 ExporterStarter/victoria-metrics
 ExporterStarter/vmalert
 ExporterStarter/victoria-metrics-data/
-
+ExporterStarter/data_handler/
+ExporterStarter/fake_exporter
+ExporterStarter/partition_data
+ExporterStarter/prometheus
+ExporterStarter/tsbs_generate_data

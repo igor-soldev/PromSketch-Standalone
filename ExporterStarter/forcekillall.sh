@@ -8,4 +8,4 @@ kill -9 $(ps aux | grep  -i 'sh run_evaluation_10000ts_avg.sh' | awk '{print $2}
 kill -9 $(ps aux | grep  -i 'sh run_evaluation_10000ts_quantile.sh' | awk '{print $2}')
 kill -9 $(ps aux | grep -i '[p]ython ../EvaluationTools/EvalData.py' | awk '{print $2}')
 
-rm -r victoria-metrics-data/
+rm -r data/

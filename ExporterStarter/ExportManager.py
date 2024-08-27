@@ -32,7 +32,7 @@ def define_targets(file, window_size, query_type):
     for port in ports:
         res.append(prefix + str(port))
     config_data["scrape_configs"][0]["static_configs"][0]["targets"] = res
-    config_data["rule_files"] = [f"{str(window_size)}samples_{query_type}.yml"]
+    config_data["rule_files"] = [f"samples_{query_type}.yml"]
     with open(file, "w") as f:
         yaml.dump(config_data, f, default_flow_style=True)
 

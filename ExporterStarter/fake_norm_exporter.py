@@ -9,9 +9,7 @@ import time
 import numpy
 
 batch_size = 1
-const_1M = 1000000
-const_2M = 2000000
-const_3M = 3000000
+caida_length = 20000000
 
 class CustomCollector(Collector):
 
@@ -21,6 +19,12 @@ class CustomCollector(Collector):
         self.machine_id_start = machine_id_start
         self.rng = numpy.random.default_rng()
         self.total_samples = 0
+        self.caida_dataset = []
+        filename = "datasets/caida2019_sourceip.txt"
+        with open(filename, "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                self.caida_dataset.append(int(line))
 
     def collect(self):
 
@@ -32,14 +36,7 @@ class CustomCollector(Collector):
         for i in range(
             self.machine_id_start, self.machine_id_start + self.num_machines
         ):
-            value = -1
-            while value < 0 or value > 100000:
-                if self.total_samples < const_1M:
-                    value = numpy.random.zipf(1.01)
-                elif self.total_samples < const_2M:
-                    value = numpy.random.uniform() * 100000
-                else:
-                    value = self.rng.normal(loc=50000, scale = 10000)
+            value = self.caida_dataset[self.total_samples % caida_length]
             self.total_samples += 1
             self.total_samples = self.total_samples % const_3M
             fake_metric.add_metric([f"machine_{i}"], value=value)

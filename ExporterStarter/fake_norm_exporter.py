@@ -20,11 +20,12 @@ class CustomCollector(Collector):
         self.rng = numpy.random.default_rng()
         self.total_samples = 0
         self.caida_dataset = []
-        filename = "datasets/caida2019_sourceip.txt"
+        filename = "datasets/caida_sourceip.txt" # CAIDA2019
         with open(filename, "r") as f:
             lines = f.readlines()
             for line in lines:
                 self.caida_dataset.append(int(line))
+        self.caida_length = len(self.caida_dataset)
 
     def collect(self):
 
@@ -36,7 +37,7 @@ class CustomCollector(Collector):
         for i in range(
             self.machine_id_start, self.machine_id_start + self.num_machines
         ):
-            value = self.caida_dataset[self.total_samples % caida_length]
+            value = self.caida_dataset[self.total_samples % self.caida_length]
             self.total_samples += 1
             self.total_samples = self.total_samples % const_3M
             fake_metric.add_metric([f"machine_{i}"], value=value)

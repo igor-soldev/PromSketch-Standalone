@@ -123,7 +123,7 @@ if __name__ == "__main__":
 
     config_file = args.config
     num_targets = args.targets
-    ts_batch_size = int(args.timeseries / num_targets)  # assume it's divisible
+    ts_batch_size = int(args.timeseries/num_targets)  # assume it's divisible
     query_type = args.querytype
     window_size = args.max_windowsize
 
@@ -135,6 +135,6 @@ if __name__ == "__main__":
     start_fake_exporters(ts_batch_size)
     
     time.sleep(max(window_size * 0.1 * 1.01, 1800))  # at least sleep 30 min
-    start_evaluation_tool(
-        num_targets, args.timeseries, args.waiteval
-    )
+    # start_evaluation_tool(
+    #     num_targets, args.timeseries, args.waiteval
+    # )

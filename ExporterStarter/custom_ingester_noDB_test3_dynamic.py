@@ -105,8 +105,12 @@ async def ingest_loop(config_file):
             #     print(f"[SCRAPE] {target}: scraped {len(metric_list)} metrics")
             #     metrics_buffer.extend(metric_list)
 
-            if len(metrics_buffer) >= MAX_BATCH_SIZE:
-                if metrics_buffer:
+            # if len(metrics_buffer) >= MAX_BATCH_SIZE:
+            # if metrics_buffer:
+            # payload
+
+            current_time = time.time()
+            if metrics_buffer and (len(metrics_buffer) >= MAX_BATCH_SIZE or current_time - last_send_time > BATCH_SEND_INTERVAL_SECONDS):
                     payload = {
                         "Timestamp": current_scrape_time,
                         "Metrics": metrics_buffer,

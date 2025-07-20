@@ -1,332 +1,110 @@
-// // package main
+package main
 
-// // import (
-// // 	"fmt"
-// // 	"log"
-// // 	"math"
-// // 	"net/http"
-// // 	"os"
-// // 	"strconv"
-// // 	"strings"
-// // 	"sync"
-// // 	"time"
+import (
+	"fmt"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
-// // 	"github.com/SieDeta/promsketch_std/promsketch"       // Replace with your actual module path
-// // 	"github.com/gin-gonic/gin"                           // Popular Go web framework
-// // 	"github.com/zzylol/prometheus-sketches/model/labels" // This path may need to match your project structure
-// // )
+	_ "net/http/pprof"
 
-// // // Structure for the metric data payload received from the Python Ingester
-// // type IngestPayload struct {
-// // 	Timestamp int64           `json:"timestamp"` // Time in milliseconds (Prometheus-compatible)
-// // 	Metrics   []MetricPayload `json:"metrics"`
-// // }
+	"github.com/SieDeta/promsketch_std/promsketch"
+	"github.com/gin-gonic/gin"
+	"github.com/zzylol/prometheus-sketches/model/labels"
+	"github.com/zzylol/prometheus-sketches/promql/parser"
+)
 
-// // // Structure for each metric in the payload
-// // type MetricPayload struct {
-// // 	Name   string            `json:"name"`   // Metric name (e.g., "fake_machine_metric")
-// // 	Labels map[string]string `json:"labels"` // Metric labels (e.g., {"machineid": "machine_0"})
-// // 	Value  float64           `json:"value"`  // Metric value
-// // }
+type IngestPayload struct {
+	Timestamp int64           `json:"timestamp"`
+	Metrics   []MetricPayload `json:"metrics"`
+}
 
-// // // Global PromSketches instance
-// // var ps *promsketch.PromSketches
+type MetricPayload struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+	Value  float64           `json:"value"`
+}
 
-// // func init() {
-// // 	ps = promsketch.NewPromSketches()
-// // 	log.Println("PromSketches instance initialized.")
+var ps *promsketch.PromSketches
+var cloudEndpoint = os.Getenv("FORWARD_ENDPOINT")
 
-// // 	// Get the number of time series from environment variable or default (for testing)
-// // 	// For production use, this may come from configuration.
-// // 	// If no value is provided, use a safe default.
-// // 	numTimeseriesStr := os.Getenv("NUM_TIMESERIES_INIT")
-// // 	numTimeseriesInit, err := strconv.Atoi(numTimeseriesStr)
-// // 	if err != nil || numTimeseriesInit == 0 {
-// // 		numTimeseriesInit = 1000 // Default, matching your EvalData.py example
-// // 	}
-// // 	if numTimeseriesInit > 2000 { // Limit to avoid excessive memory use on startup
-// // 		numTimeseriesInit = 2000
-// // 	}
+func init() {
+	ps = promsketch.NewPromSketches()
+	log.Println("PromSketches instance initialized")
+}
 
-// // 	defaultTimeWindow := int64(60 * 1000) // 60 seconds * 1000 ms/second = 60000 ms
-// // 	defaultItemWindow := int64(100000)
-// // 	defaultValueScale := float64(10000)
+func main() {
+	go logIngestionRate()
 
-// // 	// Initialize sketches for all expected time series
-// // 	for i := 0; i < numTimeseriesInit; i++ {
-// // 		machineID := fmt.Sprintf("machine_%d", i)
-// // 		lset := labels.FromStrings("machineid", machineID, "fake_metric", "fake_machine_metric")
+	router := gin.Default()
+	router.POST("/ingest", handleIngest)
+	router.GET("/query", handleQuery)
+	router.GET("/throughput_test", runThroughputTest)
+	router.GET("/parse", handleParse)
+	router.GET("/debug-state", handleDebugState)
 
-// // 		// Initialize sketches for all expected query functions
-// // 		if err := ps.NewSketchCacheInstance(lset, "avg_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale); err != nil {
-// // 			log.Printf("Error creating sketch for avg_over_time on %v: %v", lset, err)
-// // 		}
-// // 		if err := ps.NewSketchCacheInstance(lset, "quantile_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale); err != nil {
-// // 			log.Printf("Error creating sketch for quantile_over_time on %v: %v", lset, err)
-// // 		}
-// // 		if err := ps.NewSketchCacheInstance(lset, "entropy_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale); err != nil {
-// // 			log.Printf("Error creating sketch for entropy_over_time on %v: %v", lset, err)
-// // 		}
-// // 	}
-// // 	log.Printf("Initial sketches created for %d time series.", numTimeseriesInit)
-// // }
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
+	})
 
-// // func main() {
-// // 	router := gin.Default()
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
-// // 	// Endpoint to receive metric data from the Python Ingester
-// // 	// Data is sent as a JSON-formatted POST request
-// // 	router.POST("/ingest", handleIngest)
+	log.Printf("PromSketch Go server listening on :7000")
+	if err := router.Run(":7000"); err != nil {
+		log.Fatalf("Failed to run server: %v", err)
+	}
 
-// // 	// Endpoint to query sketch data (acts as a PromQL replacement)
-// // 	// Queries use a GET request with URL parameters
-// // 	router.GET("/query", handleQuery)
+}
 
-// // 	// Simple endpoint to check server status
-// // 	router.GET("/health", func(c *gin.Context) {
-// // 		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
-// // 	})
+// handleDebugState akan memeriksa 10000 time series pertama
+// dan mencetak yang mana saja yang sudah memiliki data sketch.
+func handleDebugState(c *gin.Context) {
+	log.Println("[DEBUG] Starting state check...")
+	foundCount := 0
+	detail := []string{}
 
-// // 	log.Printf("PromSketch Go server listening on :7000")
-// // 	if err := router.Run(":7000"); err != nil {
-// // 		log.Fatalf("Failed to run server: %v", err)
-// // 	}
-// // }
+	// Kita periksa dari machine_0 hingga machine_9999
+	for i := 0; i < 10000; i++ {
+		machineID := fmt.Sprintf("machine_%d", i)
+		lsetBuilder := labels.NewBuilder(labels.Labels{})
+		lsetBuilder.Set("machineid", machineID)
+		lsetBuilder.Set(labels.MetricName, "fake_metric") // Ganti sesuai metric kamu
+		lset := lsetBuilder.Labels()
 
-// // var totalIngested int64
+		minTime, maxTime := ps.PrintCoverage(lset, "avg_over_time") // Ganti ke fungsi yang kamu uji
 
-// // // handleIngest receives metric data from custom_data_ingester.py
-// // func handleIngest(c *gin.Context) {
-// // 	var payload IngestPayload
-// // 	if err := c.ShouldBindJSON(&payload); err != nil {
-// // 		log.Printf("Error binding JSON payload: %v", err)
-// // 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
-// // 		return
-// // 	}
+		if minTime != -1 {
+			foundCount++
+			log.Printf("[DEBUG] Data found for %s | Coverage: %d -> %d", machineID, minTime, maxTime)
+			detail = append(detail, fmt.Sprintf("machine_%d: %d → %d", i, minTime, maxTime))
+		}
+	}
 
-// // 	var (
-// // 		ingestedCount int64
-// // 		wg            sync.WaitGroup
-// // 		mutex         sync.Mutex
-// // 	)
+	if foundCount == 0 {
+		log.Println("[DEBUG] State check finished. NO active sketches found.")
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "state check finished",
+			"message": "No active sketches found.",
+		})
+	} else {
+		log.Printf("[DEBUG] State check finished. Found %d active sketches.", foundCount)
+		c.JSON(http.StatusOK, gin.H{
+			"status":          "state check finished",
+			"found_sketches":  foundCount,
+			"sketch_coverage": detail,
+		})
+	}
+}
 
-// // 	for _, metric := range payload.Metrics {
-// // 		wg.Add(1)
-// // 		go func(metric MetricPayload) {
-// // 			defer wg.Done()
-
-// // 			lsetBuilder := labels.NewBuilder(labels.Labels{})
-// // 			for k, v := range metric.Labels {
-// // 				lsetBuilder.Set(k, v)
-// // 			}
-// // 			lsetBuilder.Set("fake_metric", metric.Name)
-// // 			lset := lsetBuilder.Labels()
-
-// // 			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err != nil {
-// // 				log.Printf("Insert failed for %v: %v", lset, err)
-// // 				return
-// // 			}
-
-// // 			mutex.Lock()
-// // 			ingestedCount++
-// // 			mutex.Unlock()
-// // 		}(metric)
-// // 	}
-
-// // 	wg.Wait()
-
-// // 	totalIngested += ingestedCount
-// // 	log.Printf("Batch ingested: %d, Total ingested: %d", ingestedCount, totalIngested)
-
-// // 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": ingestedCount})
-// // }
-
-// // // handleQuery processes query requests from EvalData.py
-// // func handleQuery(c *gin.Context) {
-// // 	funcName := c.Query("func")
-// // 	metricName := c.Query("metric")
-
-// // 	mintStr := c.Query("mint")
-// // 	maxtStr := c.Query("maxt")
-
-// // 	log.Printf("DEBUG Query: func=%s, metric=%s, mintStr='%s', maxtStr='%s'", funcName, metricName, mintStr, maxtStr)
-
-// // 	mint, err := strconv.ParseInt(mintStr, 10, 64)
-// // 	if err != nil {
-// // 		log.Printf("ERROR: Failed to parse 'mint' parameter '%s': %v", mintStr, err)
-// // 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'mint' parameter. Must be an integer timestamp in milliseconds."})
-// // 		return
-// // 	}
-// // 	maxt, err := strconv.ParseInt(maxtStr, 10, 64)
-// // 	if err != nil {
-// // 		log.Printf("ERROR: Failed to parse 'maxt' parameter '%s': %v", maxtStr, err)
-// // 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'maxt' parameter. Must be an integer timestamp in milliseconds."})
-// // 		return
-// // 	}
-
-// // 	otherArgsStr := c.Query("args")
-// // 	otherArgs := 0.0
-// // 	if otherArgsStr != "" {
-// // 		parsedArgs, err := strconv.ParseFloat(otherArgsStr, 64)
-// // 		if err != nil {
-// // 			log.Printf("[Error] Failed to parse args: %v", err)
-// // 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'args' parameter. Must be a float."})
-// // 			return
-// // 		}
-// // 		otherArgs = parsedArgs
-// // 	}
-// // 	log.Printf("[Query] args=%.4f", otherArgs)
-
-// // 	// Build label set
-// // 	lsetBuilder := labels.NewBuilder(labels.Labels{})
-// // 	for k, v := range c.Request.URL.Query() {
-// // 		if strings.HasPrefix(k, "label_") {
-// // 			labelKey := k[len("label_"):]
-// // 			labelValue := v[0]
-// // 			lsetBuilder.Set(labelKey, labelValue)
-// // 			log.Printf("[Label] %s=%s", labelKey, labelValue)
-// // 		}
-// // 	}
-// // 	lsetBuilder.Set("fake_metric", metricName)
-// // 	lset := lsetBuilder.Labels()
-// // 	log.Printf("[LabelSet] Final lset: %v", lset)
-
-// // 	curTime := time.Now().UnixMilli()
-// // 	isCovered := ps.LookUp(lset, funcName, mint, maxt)
-// // 	if !isCovered {
-// // 		log.Printf("[Sketch] Data NOT covered for range [%d, %d] on %v for func=%s", mint, maxt, lset, funcName)
-// // 		c.JSON(http.StatusAccepted, gin.H{
-// // 			"status":  "pending",
-// // 			"message": "Sketch data not yet available. Try again later.",
-// // 		})
-// // 		return
-// // 	}
-// // 	log.Printf("[Sketch] Data covered for range [%d, %d] on %v for func=%s", mint, maxt, lset, funcName)
-
-// // 	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
-// // 	log.Printf("[Eval] Raw result length: %d", len(vector))
-
-// // 	// Filter out NaN or invalid results
-// // 	results := []map[string]interface{}{}
-// // 	for i, sample := range vector {
-// // 		if math.IsNaN(sample.F) || sample.T == 0 {
-// // 			log.Printf("[Eval] Skipping invalid sample #%d: timestamp=%d, value=%.4f", i, sample.T, sample.F)
-// // 			continue
-// // 		}
-// // 		results = append(results, map[string]interface{}{
-// // 			"value":     sample.F,
-// // 			"timestamp": sample.T,
-// // 		})
-// // 	}
-
-// // 	// Prepare JSON response
-// // 	response := gin.H{
-// // 		"status": "success",
-// // 		"data":   results,
-// // 	}
-// // 	if annotations != nil && len(annotations) > 0 {
-// // 		response["annotations"] = annotations
-// // 		log.Printf("[Eval] Annotations: %+v", annotations)
-// // 	}
-
-// // 	if len(results) == 0 {
-// // 		log.Printf("[Query] All samples are invalid or sketch not yet populated. Returning empty result.")
-// // 	}
-
-// // 	c.Header("Content-Type", "application/json")
-// // 	c.JSON(http.StatusOK, response)
-// // 	log.Printf("[Query] func=%s on lset=%v (range %d-%d) returned %d valid result(s).", funcName, lset, mint, maxt, len(results))
-// // }
-
-// ===============================================================================================================
-// ===============================================================================================================
-// ===============================================================================================================
-// ===============================================================================================================
-
-// package main
-
-// import (
-// 	"fmt"
-// 	"log"
-// 	"math"
-// 	"net/http"
-// 	"os"
-// 	"strconv"
-// 	"strings"
-// 	"sync"
-// 	"sync/atomic"
-// 	"time"
-
-// 	_ "net/http/pprof"
-
-// 	"github.com/SieDeta/promsketch_std/promsketch"       // Replace with your actual module path
-// 	"github.com/gin-gonic/gin"                           // Popular Go web framework
-// 	"github.com/zzylol/prometheus-sketches/model/labels" // This path may need to match your project structure
-// )
-
-// // Structure for the metric data payload received from the Python Ingester
-// type IngestPayload struct {
-// 	Timestamp int64           `json:"timestamp"`
-// 	Metrics   []MetricPayload `json:"metrics"`
-// }
-
-// type MetricPayload struct {
-// 	Name   string            `json:"name"`
-// 	Labels map[string]string `json:"labels"`
-// 	Value  float64           `json:"value"`
-// }
-
-// var ps *promsketch.PromSketches
-
-// func init() {
-// 	ps = promsketch.NewPromSketches()
-// 	log.Println("PromSketches instance initialized.")
-
-// 	numTimeseriesStr := os.Getenv("NUM_TIMESERIES_INIT")
-// 	numTimeseriesInit, err := strconv.Atoi(numTimeseriesStr)
-// 	if err != nil || numTimeseriesInit == 0 {
-// 		numTimeseriesInit = 1000
-// 	}
-// 	if numTimeseriesInit > 2000 {
-// 		numTimeseriesInit = 2000
-// 	}
-
-// 	defaultTimeWindow := int64(60 * 1000)
-// 	defaultItemWindow := int64(100000)
-// 	defaultValueScale := float64(10000)
-
-// 	for i := 0; i < numTimeseriesInit; i++ {
-// 		machineID := fmt.Sprintf("machine_%d", i)
-// 		lset := labels.FromStrings("machineid", machineID, "fake_metric", "fake_machine_metric")
-
-// 		_ = ps.NewSketchCacheInstance(lset, "avg_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-// 		_ = ps.NewSketchCacheInstance(lset, "quantile_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-// 		_ = ps.NewSketchCacheInstance(lset, "entropy_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-// 	}
-// 	log.Printf("Initial sketches created for %d time series.", numTimeseriesInit)
-// }
-
-// func main() {
-// 	go logIngestionRate()
-
-// 	router := gin.Default()
-// 	router.POST("/ingest", handleIngest)
-// 	router.GET("/query", handleQuery)
-// 	router.GET("/health", func(c *gin.Context) {
-// 		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
-// 	})
-
-// 	go func() {
-// 		log.Println(http.ListenAndServe("localhost:6060", nil))
-// 	}()
-
-// 	log.Printf("PromSketch Go server listening on :7000")
-// 	if err := router.Run(":7000"); err != nil {
-// 		log.Fatalf("Failed to run server: %v", err)
-// 	}
-// }
-
-// var totalIngested int64
+var totalIngested int64
 
 // func handleIngest(c *gin.Context) {
 // 	var payload IngestPayload
@@ -343,226 +121,136 @@
 // 		wg.Add(1)
 // 		go func(metric MetricPayload) {
 // 			defer wg.Done()
+
+// 			log.Printf("[INGEST] name=%s labels=%v value=%.2f", metric.Name, metric.Labels, metric.Value)
+
 // 			lsetBuilder := labels.NewBuilder(labels.Labels{})
+// 			// Tambahkan label dari payload (cth: machineid="machine_0")
 // 			for k, v := range metric.Labels {
 // 				lsetBuilder.Set(k, v)
 // 			}
-// 			lsetBuilder.Set("fake_metric", metric.Name)
+// 			lsetBuilder.Set(labels.MetricName, metric.Name) // labels.MetricName = "__name__"
 // 			lset := lsetBuilder.Labels()
 
-// 			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err == nil {
-// 				atomic.AddInt64(&totalIngested, 1)
+// 			log.Printf("[INGEST] Inserting to sketch: name=%s labels=%v ts=%d value=%.2f", metric.Name, metric.Labels, payload.Timestamp, metric.Value)
+
+// 			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err != nil {
+// 				log.Printf("[INGEST ERROR] Failed to insert sketch: %v", err)
 // 			}
+// 			atomic.AddInt64(&totalIngested, 1)
+
 // 		}(metric)
 // 	}
+
 // 	wg.Wait()
-// 	duration := time.Since(start).Milliseconds()
-// 	log.Printf("[RECEIVED] %d metrics in %.2fms", len(payload.Metrics), float64(duration))
-
-// 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
-// }
-
-// func logIngestionRate() {
-// 	var lastTotal int64 = 0
-// 	for {
-// 		time.Sleep(5 * time.Second)
-// 		current := atomic.LoadInt64(&totalIngested)
-// 		rate := float64(current-lastTotal) / 5.0
-// 		log.Printf("[SERVER SPEED] Received %.2f samples/sec (Total: %d)", rate, current)
-// 		lastTotal = current
-// 	}
-// }
-
-// func handleQuery(c *gin.Context) {
-// 	funcName := c.Query("func")
-// 	metricName := c.Query("metric")
-// 	mintStr := c.Query("mint")
-// 	maxtStr := c.Query("maxt")
-
-// 	log.Printf("DEBUG Query: func=%s, metric=%s, mintStr='%s', maxtStr='%s'", funcName, metricName, mintStr, maxtStr)
-
-// 	mint, err := strconv.ParseInt(mintStr, 10, 64)
-// 	if err != nil {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'mint' parameter. Must be an integer timestamp in milliseconds."})
-// 		return
-// 	}
-// 	maxt, err := strconv.ParseInt(maxtStr, 10, 64)
-// 	if err != nil {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'maxt' parameter. Must be an integer timestamp in milliseconds."})
-// 		return
-// 	}
-
-// 	otherArgsStr := c.Query("args")
-// 	otherArgs := 0.0
-// 	if otherArgsStr != "" {
-// 		parsedArgs, err := strconv.ParseFloat(otherArgsStr, 64)
-// 		if err != nil {
-// 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'args' parameter. Must be a float."})
-// 			return
-// 		}
-// 		otherArgs = parsedArgs
-// 	}
-
-// 	lsetBuilder := labels.NewBuilder(labels.Labels{})
-// 	for k, v := range c.Request.URL.Query() {
-// 		if strings.HasPrefix(k, "label_") {
-// 			labelKey := k[len("label_"):len(k)]
-// 			labelValue := v[0]
-// 			lsetBuilder.Set(labelKey, labelValue)
-// 		}
-// 	}
-// 	lsetBuilder.Set("fake_metric", metricName)
-// 	lset := lsetBuilder.Labels()
-
-// 	curTime := time.Now().UnixMilli()
-// 	if !ps.LookUp(lset, funcName, mint, maxt) {
-// 		c.JSON(http.StatusAccepted, gin.H{"status": "pending", "message": "Sketch data not yet available. Try again later."})
-// 		return
-// 	}
-
-// 	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
-// 	results := []map[string]interface{}{}
-// 	for _, sample := range vector {
-// 		if !math.IsNaN(sample.F) && sample.T != 0 {
-// 			results = append(results, map[string]interface{}{"value": sample.F, "timestamp": sample.T})
-// 		}
-// 	}
-// 	response := gin.H{"status": "success", "data": results}
-// 	if len(annotations) > 0 {
-// 		response["annotations"] = annotations
-// 	}
-// 	c.JSON(http.StatusOK, response)
-// }
-
-// ===================================== NEW MAIN CODE ====================================================
-// ===============================================================================================================
-// ===============================================================================================================
-// ===============================================================================================================
-
-// package main
-
-// import (
-// 	"bytes"
-// 	"encoding/json"
-// 	"fmt"
-// 	"log"
-// 	"math"
-// 	"net/http"
-// 	"os"
-// 	"strconv"
-// 	"strings"
-// 	"sync"
-// 	"sync/atomic"
-// 	"time"
-
-// 	_ "net/http/pprof"
-
-// 	"github.com/SieDeta/promsketch_std/promsketch"
-// 	"github.com/gin-gonic/gin"
-// 	"github.com/zzylol/prometheus-sketches/model/labels"
-// )
-
-// // Structure for the metric data payload received from the Python Ingester
-// type IngestPayload struct {
-// 	Timestamp int64           `json:"timestamp"`
-// 	Metrics   []MetricPayload `json:"metrics"`
-// }
-
-// type MetricPayload struct {
-// 	Name   string            `json:"name"`
-// 	Labels map[string]string `json:"labels"`
-// 	Value  float64           `json:"value"`
-// }
-
-// var ps *promsketch.PromSketches
-// var cloudEndpoint = os.Getenv("FORWARD_ENDPOINT")
-
-// func init() {
-// 	ps = promsketch.NewPromSketches()
-// 	log.Println("PromSketches instance initialized.")
-
-// 	numTimeseriesStr := os.Getenv("NUM_TIMESERIES_INIT")
-// 	numTimeseriesInit, err := strconv.Atoi(numTimeseriesStr)
-// 	if err != nil || numTimeseriesInit == 0 {
-// 		numTimeseriesInit = 1000
-// 	}
-// 	if numTimeseriesInit > 2000 {
-// 		numTimeseriesInit = 2000
-// 	}
-
-// 	defaultTimeWindow := int64(60 * 1000)
-// 	defaultItemWindow := int64(100000)
-// 	defaultValueScale := float64(10000)
-
-// 	for i := 0; i < numTimeseriesInit; i++ {
-// 		machineID := fmt.Sprintf("machine_%d", i)
-// 		lset := labels.FromStrings("machineid", machineID, "fake_metric", "fake_machine_metric")
-
-// 		_ = ps.NewSketchCacheInstance(lset, "avg_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-// 		_ = ps.NewSketchCacheInstance(lset, "quantile_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-// 		_ = ps.NewSketchCacheInstance(lset, "entropy_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-// 	}
-// 	log.Printf("Initial sketches created for %d time series.", numTimeseriesInit)
-// }
-
-// func main() {
-// 	go logIngestionRate()
-
-// 	router := gin.Default()
-// 	router.POST("/ingest", handleIngest)
-// 	router.GET("/query", handleQuery)
-// 	router.GET("/health", func(c *gin.Context) {
-// 		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
-// 	})
-
-// 	// Start pprof server for profiling
-// 	go func() {
-// 		log.Println(http.ListenAndServe("localhost:6060", nil))
-// 	}()
-
-// 	log.Printf("PromSketch Go server listening on :7000")
-// 	if err := router.Run(":7000"); err != nil {
-// 		log.Fatalf("Failed to run server: %v", err)
-// 	}
-// }
-
-// var totalIngested int64
-
-// func handleIngest(c *gin.Context) {
-// 	var payload IngestPayload
-// 	if err := c.ShouldBindJSON(&payload); err != nil {
-// 		log.Printf("Error binding JSON payload: %v", err)
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
-// 		return
-// 	}
-
-// 	start := time.Now()
-// 	var wg sync.WaitGroup
-
-// 	for _, metric := range payload.Metrics {
-// 		wg.Add(1)
-// 		go func(metric MetricPayload) {
-// 			defer wg.Done()
-// 			lsetBuilder := labels.NewBuilder(labels.Labels{})
-// 			for k, v := range metric.Labels {
-// 				lsetBuilder.Set(k, v)
-// 			}
-// 			lsetBuilder.Set("fake_metric", metric.Name)
-// 			lset := lsetBuilder.Labels()
-
-// 			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err == nil {
-// 				atomic.AddInt64(&totalIngested, 1)
-// 			}
-// 		}(metric)
-// 	}
-// 	wg.Wait()
-// 	duration := time.Since(start).Milliseconds()
-// 	log.Printf("[RECEIVED] %d metrics in %.2fms", len(payload.Metrics), float64(duration))
+// 	totalDuration := time.Since(start).Milliseconds()
+// 	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
 
 // 	go forwardToCloud(payload)
 
 // 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
 // }
+
+func handleIngest(c *gin.Context) {
+	var payload IngestPayload
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		log.Printf("Error binding JSON payload: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
+		return
+	}
+
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	for _, metric := range payload.Metrics {
+		wg.Add(1)
+		go func(metric MetricPayload) {
+			defer wg.Done()
+
+			log.Printf("[INGEST] name=%s labels=%v value=%.2f", metric.Name, metric.Labels, metric.Value)
+
+			lsetBuilder := labels.NewBuilder(labels.Labels{})
+			// Tambahkan label dari payload (cth: machineid="machine_0")
+			for k, v := range metric.Labels {
+				lsetBuilder.Set(k, v)
+			}
+			lsetBuilder.Set(labels.MetricName, metric.Name) // labels.MetricName = "__name__"
+			lset := lsetBuilder.Labels()
+
+			log.Printf("[INGEST] Inserting to sketch: name=%s labels=%v ts=%d value=%.2f", metric.Name, metric.Labels, payload.Timestamp, metric.Value)
+
+			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err == nil {
+				atomic.AddInt64(&totalIngested, 1)
+
+				// Push raw metric to Prometheus
+				labels := map[string]string{}
+				for k, v := range metric.Labels {
+					labels[k] = v
+				}
+				labels["__name__"] = metric.Name
+				pushSyntheticResult(metric.Name, labels, metric.Value, payload.Timestamp)
+			}
+
+		}(metric)
+	}
+
+	wg.Wait()
+	totalDuration := time.Since(start).Milliseconds()
+	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
+
+	go forwardToCloud(payload)
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
+}
+
+func pushSyntheticResult(metricName string, labels map[string]string, value float64, timestamp int64) {
+	pushgatewayURL := os.Getenv("PUSHGATEWAY_URL")
+	if pushgatewayURL == "" {
+		pushgatewayURL = "http://localhost:9091"
+	}
+
+	labelParts := []string{}
+	for k, v := range labels {
+		if k == "__name__" {
+			continue // jangan push label __name__
+		}
+		labelParts = append(labelParts, fmt.Sprintf("%s=\"%s\"", k, v))
+	}
+
+	labelStr := strings.Join(labelParts, ",")
+
+	body := fmt.Sprintf("%s{%s} %f\n", metricName, labelStr, value)
+
+	instanceID := labels["machineid"]
+	if instanceID == "" {
+		instanceID = "default"
+	}
+
+	url := fmt.Sprintf("%s/metrics/job/promsketch_push/instance/%s", pushgatewayURL, instanceID)
+
+	log.Printf("[PUSH DEBUG] Pushing to %s with body:\n%s", url, body)
+
+	req, err := http.NewRequest("PUT", url, strings.NewReader(body))
+	if err != nil {
+		log.Printf("[PUSH ERROR] request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "text/plain")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[PUSH ERROR] send: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		log.Printf("[PUSH ERROR] status: %s", resp.Status)
+	} else {
+		log.Printf("[PUSH OK] metric=%s labels=%v value=%.2f", metricName, labels, value)
+	}
+}
 
 // func forwardToCloud(payload IngestPayload) {
 // 	if cloudEndpoint == "" {
@@ -574,7 +262,6 @@
 // 		log.Printf("[FORWARD ERROR] marshal: %v", err)
 // 		return
 // 	}
-
 // 	req, err := http.NewRequest("POST", cloudEndpoint, bytes.NewBuffer(data))
 // 	if err != nil {
 // 		log.Printf("[FORWARD ERROR] request: %v", err)
@@ -597,238 +284,16 @@
 // 	}
 // }
 
-// func logIngestionRate() {
-// 	var lastTotal int64 = 0
-// 	for {
-// 		time.Sleep(5 * time.Second)
-// 		current := atomic.LoadInt64(&totalIngested)
-// 		rate := float64(current-lastTotal) / 5.0
-// 		log.Printf("[SERVER SPEED] Received %.2f samples/sec (Total: %d)", rate, current)
-// 		lastTotal = current
-// 	}
-// }
-
-// func handleQuery(c *gin.Context) {
-// 	funcName := c.Query("func")
-// 	metricName := c.Query("metric")
-// 	mintStr := c.Query("mint")
-// 	maxtStr := c.Query("maxt")
-
-// 	log.Printf("DEBUG Query: func=%s, metric=%s, mintStr='%s', maxtStr='%s'", funcName, metricName, mintStr, maxtStr)
-
-// 	mint, err := strconv.ParseInt(mintStr, 10, 64)
-// 	if err != nil {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'mint' parameter. Must be an integer timestamp in milliseconds."})
-// 		return
-// 	}
-// 	maxt, err := strconv.ParseInt(maxtStr, 10, 64)
-// 	if err != nil {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'maxt' parameter. Must be an integer timestamp in milliseconds."})
-// 		return
-// 	}
-
-// 	otherArgsStr := c.Query("args")
-// 	otherArgs := 0.0
-// 	if otherArgsStr != "" {
-// 		parsedArgs, err := strconv.ParseFloat(otherArgsStr, 64)
-// 		if err != nil {
-// 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid 'args' parameter. Must be a float."})
-// 			return
-// 		}
-// 		otherArgs = parsedArgs
-// 	}
-
-// 	lsetBuilder := labels.NewBuilder(labels.Labels{})
-// 	for k, v := range c.Request.URL.Query() {
-// 		if strings.HasPrefix(k, "label_") {
-// 			labelKey := k[len("label_"):]
-// 			labelValue := v[0]
-// 			lsetBuilder.Set(labelKey, labelValue)
-// 		}
-// 	}
-// 	lsetBuilder.Set("fake_metric", metricName)
-// 	lset := lsetBuilder.Labels()
-
-// 	curTime := time.Now().UnixMilli()
-// 	if !ps.LookUp(lset, funcName, mint, maxt) {
-// 		c.JSON(http.StatusAccepted, gin.H{"status": "pending", "message": "Sketch data not yet available. Try again later."})
-// 		return
-// 	}
-
-// 	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
-// 	results := []map[string]interface{}{}
-// 	for _, sample := range vector {
-// 		if !math.IsNaN(sample.F) && sample.T != 0 {
-// 			results = append(results, map[string]interface{}{"value": sample.F, "timestamp": sample.T})
-// 		}
-// 	}
-// 	response := gin.H{"status": "success", "data": results}
-// 	if len(annotations) > 0 {
-// 		response["annotations"] = annotations
-// 	}
-// 	c.JSON(http.StatusOK, response)
-// }
-
-// =================================== TEST Throughput ==========================================================
-package main
-
-import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"log"
-	"math"
-	"net/http"
-	"os"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	_ "net/http/pprof"
-
-	"github.com/SieDeta/promsketch_std/promsketch"
-	"github.com/gin-gonic/gin"
-	"github.com/zzylol/prometheus-sketches/model/labels"
-)
-
-type IngestPayload struct {
-	Timestamp int64           `json:"timestamp"`
-	Metrics   []MetricPayload `json:"metrics"`
-}
-
-type MetricPayload struct {
-	Name   string            `json:"name"`
-	Labels map[string]string `json:"labels"`
-	Value  float64           `json:"value"`
-}
-
-var ps *promsketch.PromSketches
-var cloudEndpoint = os.Getenv("FORWARD_ENDPOINT")
-
-func init() {
-	ps = promsketch.NewPromSketches()
-	log.Println("PromSketches instance initialized.")
-
-	numTimeseriesStr := os.Getenv("NUM_TIMESERIES_INIT")
-	numTimeseriesInit, err := strconv.Atoi(numTimeseriesStr)
-	if err != nil || numTimeseriesInit == 0 {
-		numTimeseriesInit = 1000
-	}
-	if numTimeseriesInit > 2000 {
-		numTimeseriesInit = 2000
-	}
-
-	defaultTimeWindow := int64(60 * 1000)
-	defaultItemWindow := int64(100000)
-	defaultValueScale := float64(10000)
-
-	for i := 0; i < numTimeseriesInit; i++ {
-		machineID := fmt.Sprintf("machine_%d", i)
-		lset := labels.FromStrings("machineid", machineID, "fake_metric", "fake_machine_metric")
-		_ = ps.NewSketchCacheInstance(lset, "avg_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-		_ = ps.NewSketchCacheInstance(lset, "quantile_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-		_ = ps.NewSketchCacheInstance(lset, "entropy_over_time", defaultTimeWindow, defaultItemWindow, defaultValueScale)
-	}
-	log.Printf("Initial sketches created for %d time series.", numTimeseriesInit)
-}
-
-func main() {
-	go logIngestionRate()
-
-	router := gin.Default()
-	router.POST("/ingest", handleIngest)
-	router.GET("/query", handleQuery)
-	router.GET("/throughput_test", runThroughputTest)
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
-	})
-
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
-
-	log.Printf("PromSketch Go server listening on :7000")
-	if err := router.Run(":7000"); err != nil {
-		log.Fatalf("Failed to run server: %v", err)
-	}
-
-}
-
-var totalIngested int64
-
-func handleIngest(c *gin.Context) {
-	var payload IngestPayload
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		log.Printf("Error binding JSON payload: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
-		return
-	}
-
-	start := time.Now()
-	var wg sync.WaitGroup
-
-	for _, metric := range payload.Metrics {
-		wg.Add(1)
-		go func(metric MetricPayload) {
-			defer wg.Done()
-
-			lsetBuilder := labels.NewBuilder(labels.Labels{})
-			for k, v := range metric.Labels {
-				lsetBuilder.Set(k, v)
-			}
-			lsetBuilder.Set("fake_metric", metric.Name)
-			lset := lsetBuilder.Labels()
-
-			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err != nil {
-				log.Printf("[ERROR] Failed to insert sketch for labels %v: %v", lset, err)
-				return
-			}
-
-			atomic.AddInt64(&totalIngested, 1)
-
-		}(metric)
-	}
-
-	wg.Wait()
-	totalDuration := time.Since(start).Milliseconds()
-	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
-
-	go forwardToCloud(payload)
-
-	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
-}
-
 func forwardToCloud(payload IngestPayload) {
-	if cloudEndpoint == "" {
-		log.Printf("[FORWARD] Skipped: FORWARD_ENDPOINT not set")
-		return
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("[FORWARD ERROR] marshal: %v", err)
-		return
-	}
-	req, err := http.NewRequest("POST", cloudEndpoint, bytes.NewBuffer(data))
-	if err != nil {
-		log.Printf("[FORWARD ERROR] request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[FORWARD ERROR] send: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		log.Printf("[FORWARD ERROR] status: %s", resp.Status)
-	} else {
-		log.Printf("[FORWARD] success: %d bytes sent", len(data))
+	for _, metric := range payload.Metrics {
+		url := fmt.Sprintf("http://pushgateway:9091/metrics/job/promsketch/instance/%s", metric.Labels["machineid"])
+		body := fmt.Sprintf("fake_metric{machineid=\"%s\"} %f\n", metric.Labels["machineid"], metric.Value)
+		resp, err := http.Post(url, "text/plain", strings.NewReader(body))
+		if err != nil {
+			log.Printf("[PUSHGATEWAY ERROR] %v", err)
+			continue
+		}
+		resp.Body.Close()
 	}
 }
 
@@ -916,6 +381,305 @@ func handleQuery(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, resp)
 }
+
+// func handleParse(c *gin.Context) {
+// 	query := c.Query("q")
+// 	if query == "" {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing query parameter 'q'"})
+// 		return
+// 	}
+
+// 	expr, err := parser.ParseExpr(query)
+// 	if err != nil {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Parse error: %v", err)})
+// 		return
+// 	}
+
+// 	c.JSON(http.StatusOK, gin.H{
+// 		"status": "success",
+// 		"ast":    expr.String(),
+// 	})
+// }
+
+func handleParse(c *gin.Context) {
+	query := c.Query("q")
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing query parameter 'q'"})
+		return
+	}
+	log.Printf("[QUERY ENGINE] Received query: %s", query)
+
+	expr, err := parser.ParseExpr(query)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Parse error: %v", err)})
+		return
+	}
+
+	call, ok := expr.(*parser.Call)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Query must be a function call (e.g., avg_over_time(...))"})
+		return
+	}
+
+	funcName := call.Func.Name
+	otherArgs := 0.0
+
+	matrixSelectorArg := call.Args[len(call.Args)-1]
+	rangeArg, ok := matrixSelectorArg.(*parser.MatrixSelector)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "The last argument must be a range vector (e.g., metric[60000ms])"})
+		return
+	}
+
+	if len(call.Args) > 1 {
+		firstArg, ok := call.Args[0].(*parser.NumberLiteral)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Numeric argument (like quantile) must be a number"})
+			return
+		}
+		otherArgs = firstArg.Val
+	}
+
+	vs, ok := rangeArg.VectorSelector.(*parser.VectorSelector)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse vector selector inside the range vector"})
+		return
+	}
+	metricName := vs.Name
+	labelMap := make(map[string]string)
+	for _, matcher := range vs.LabelMatchers {
+		if matcher.Type == labels.MatchEqual {
+			labelMap[matcher.Name] = matcher.Value
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Only '=' label matchers are supported"})
+			return
+		}
+	}
+
+	lsetBuilder := labels.NewBuilder(labels.Labels{})
+	for k, v := range labelMap {
+		lsetBuilder.Set(k, v)
+	}
+	lsetBuilder.Set(labels.MetricName, metricName)
+	lset := lsetBuilder.Labels()
+
+	log.Printf("[QUERY ENGINE] Parsed components: func=%s, lset=%v, otherArgs=%.2f", funcName, lset, otherArgs)
+
+	// Calculate the time range based on the range
+	queryDuration := rangeArg.Range
+	maxt := time.Now().UnixMilli()
+	mint := maxt - queryDuration.Milliseconds()
+
+	// GEt sketch value
+	sketchMin, sketchMax := ps.PrintCoverage(lset, funcName)
+	log.Printf("[SKETCH COVERAGE] Sketch coverage: min=%d max=%d | requested mint=%d maxt=%d", sketchMin, sketchMax, mint, maxt)
+
+	// If there's no data in sketch
+	if sketchMin == -1 || sketchMax == -1 {
+		log.Printf("[QUERY ENGINE] No sketch coverage available yet for %v. Creating instance.", lset)
+		ps.NewSketchCacheInstance(lset, funcName, queryDuration.Milliseconds(), 100000, 10000.0)
+
+		c.JSON(http.StatusAccepted, gin.H{
+			"status":  "pending",
+			"message": "Sketch data is being prepared. Please try again in a few moments.",
+		})
+		return
+	}
+
+	// COrrection if requested query outside the range
+	if mint < sketchMin {
+		mint = sketchMin
+	}
+	if maxt > sketchMax {
+		maxt = sketchMax
+	}
+
+	// Validasi akhir
+	if maxt <= mint {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status":  "failed",
+			"message": "Query time range is outside of sketch data coverage.",
+		})
+		return
+	}
+
+	curTime := maxt
+
+	log.Printf("[QUERY ENGINE] Final adjusted range: mint=%d maxt=%d", mint, maxt)
+
+	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
+
+	results := []map[string]interface{}{}
+	for _, sample := range vector {
+		if !math.IsNaN(sample.F) && sample.T != 0 {
+			results = append(results, map[string]interface{}{
+				"timestamp": sample.T,
+				"value":     sample.F,
+			})
+
+			// Push synthetic query result
+			syntheticLabels := map[string]string{
+				"machineid":       lset.Get("machineid"),
+				"original_metric": lset.Get("__name__"),
+				"function":        funcName,
+			}
+			if funcName == "quantile_over_time" {
+				syntheticLabels["quantile"] = fmt.Sprintf("%.2f", otherArgs)
+			}
+			pushSyntheticResult("promsketch_query_result", syntheticLabels, sample.F, sample.T)
+		}
+		pushSyntheticResult(
+			"promsketch_query_result",
+			map[string]string{
+				"machineid": labelMap["machineid"],
+				"function":  funcName,
+			},
+			sample.F,
+			sample.T,
+		)
+	}
+
+	log.Printf("[QUERY ENGINE] Evaluation successful. Returning %d data points.", len(results))
+	response := gin.H{
+		"status": "success",
+		"data":   results,
+	}
+	if len(annotations) > 0 {
+		response["annotations"] = annotations
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// func handleParse(c *gin.Context) {
+// 	query := c.Query("q")
+// 	if query == "" {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing query parameter 'q'"})
+// 		return
+// 	}
+// 	log.Printf("[QUERY ENGINE] Received query: %s", query)
+
+// 	expr, err := parser.ParseExpr(query)
+// 	if err != nil {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Parse error: %v", err)})
+// 		return
+// 	}
+
+// 	call, ok := expr.(*parser.Call)
+// 	if !ok {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Query must be a function call (e.g., avg_over_time(...))"})
+// 		return
+// 	}
+
+// 	funcName := call.Func.Name
+// 	otherArgs := 0.0
+
+// 	matrixSelectorArg := call.Args[len(call.Args)-1]
+// 	rangeArg, ok := matrixSelectorArg.(*parser.MatrixSelector)
+// 	if !ok {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": "The last argument must be a range vector (e.g., metric[60000ms])"})
+// 		return
+// 	}
+
+// 	if len(call.Args) > 1 {
+// 		firstArg, ok := call.Args[0].(*parser.NumberLiteral)
+// 		if !ok {
+// 			c.JSON(http.StatusBadRequest, gin.H{"error": "Numeric argument (like quantile) must be a number"})
+// 			return
+// 		}
+// 		otherArgs = firstArg.Val
+// 	}
+
+// 	vs, ok := rangeArg.VectorSelector.(*parser.VectorSelector)
+// 	if !ok {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse vector selector inside the range vector"})
+// 		return
+// 	}
+// 	metricName := vs.Name
+// 	labelMap := make(map[string]string)
+// 	for _, matcher := range vs.LabelMatchers {
+// 		if matcher.Type == labels.MatchEqual {
+// 			labelMap[matcher.Name] = matcher.Value
+// 		} else {
+// 			c.JSON(http.StatusBadRequest, gin.H{"error": "Only '=' label matchers are supported"})
+// 			return
+// 		}
+// 	}
+
+// 	lsetBuilder := labels.NewBuilder(labels.Labels{})
+// 	for k, v := range labelMap {
+// 		lsetBuilder.Set(k, v)
+// 	}
+// 	lsetBuilder.Set(labels.MetricName, metricName)
+// 	lset := lsetBuilder.Labels()
+
+// 	log.Printf("[QUERY ENGINE] Parsed components: func=%s, lset=%v, otherArgs=%.2f", funcName, lset, otherArgs)
+
+// 	// Calculate the time range based on the range
+// 	queryDuration := rangeArg.Range
+// 	maxt := time.Now().UnixMilli()
+// 	mint := maxt - queryDuration.Milliseconds()
+
+// 	// GEt sketch value
+// 	sketchMin, sketchMax := ps.PrintCoverage(lset, funcName)
+// 	log.Printf("[SKETCH COVERAGE] Sketch coverage: min=%d max=%d | requested mint=%d maxt=%d", sketchMin, sketchMax, mint, maxt)
+
+// 	// If there's no data in sketch
+// 	if sketchMin == -1 || sketchMax == -1 {
+// 		log.Printf("[QUERY ENGINE] No sketch coverage available yet for %v. Creating instance.", lset)
+// 		ps.NewSketchCacheInstance(lset, funcName, queryDuration.Milliseconds(), 100000, 10000.0)
+
+// 		c.JSON(http.StatusAccepted, gin.H{
+// 			"status":  "pending",
+// 			"message": "Sketch data is being prepared. Please try again in a few moments.",
+// 		})
+// 		return
+// 	}
+
+// 	// COrrection if requested query outside the range
+// 	if mint < sketchMin {
+// 		mint = sketchMin
+// 	}
+// 	if maxt > sketchMax {
+// 		maxt = sketchMax
+// 	}
+
+// 	// Validasi akhir
+// 	if maxt <= mint {
+// 		c.JSON(http.StatusBadRequest, gin.H{
+// 			"status":  "failed",
+// 			"message": "Query time range is outside of sketch data coverage.",
+// 		})
+// 		return
+// 	}
+
+// 	curTime := maxt
+
+// 	log.Printf("[QUERY ENGINE] Final adjusted range: mint=%d maxt=%d", mint, maxt)
+
+// 	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
+
+// 	results := []map[string]interface{}{}
+// 	for _, sample := range vector {
+// 		if !math.IsNaN(sample.F) {
+// 			results = append(results, map[string]interface{}{
+// 				"timestamp": sample.T,
+// 				"value":     sample.F,
+// 			})
+// 		}
+// 	}
+
+// 	log.Printf("[QUERY ENGINE] Evaluation successful. Returning %d data points.", len(results))
+// 	response := gin.H{
+// 		"status": "success",
+// 		"data":   results,
+// 	}
+// 	if len(annotations) > 0 {
+// 		response["annotations"] = annotations
+// 	}
+
+// 	c.JSON(http.StatusOK, response)
+// }
 
 func runThroughputTest(c *gin.Context) {
 	num := 10000

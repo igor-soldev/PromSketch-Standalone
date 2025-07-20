@@ -591,6 +591,17 @@ func (ps *PromSketches) LookUpAndUpdateWindow(lset labels.Labels, funcName strin
 func (ps *PromSketches) Eval(funcName string, lset labels.Labels, otherArgs float64, mint, maxt, cur_time int64) (Vector, annotations.Annotations) {
 	sfunc := FunctionCalls[funcName]
 	series := ps.series.getByHash(lset.Hash(), lset)
+	if series == nil {
+		return nil, nil
+	}
+
+	fmt.Printf("[EVAL] Function: %s, TimeRange: %d → %d\n", funcName, mint, maxt)
+	fmt.Printf("[EVAL] Labels: %s\n", lset.String())
+
+	// Bisa juga log isi sketch: jumlah sampel, min/max waktu
+	if series.sketchInstances.sampling != nil {
+		fmt.Printf("[EVAL] Sampling sketch size: %d\n", len(series.sketchInstances.sampling.Arr))
+	}
 
 	return sfunc(context.TODO(), series, otherArgs, mint, maxt, cur_time), nil
 }

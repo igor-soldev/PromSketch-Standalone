@@ -2,11 +2,15 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,7 +70,7 @@ func init() {
 	if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
 		maxIngestGoroutines = parsed
 	} else {
-		maxIngestGoroutines = 3 // default fallback
+		maxIngestGoroutines = 1024 // default fallback
 	}
 
 	prometheus.MustRegister(ingestedMetrics)
@@ -85,6 +89,9 @@ type PortServer struct {
 	Port     int
 	Registry *prometheus.Registry
 	Metrics  *prometheus.GaugeVec
+	// RAW per-port
+	Raw    map[string]*prometheus.GaugeVec
+	RawMux sync.Mutex
 }
 
 func NewPortServer(port int) *PortServer {
@@ -92,9 +99,9 @@ func NewPortServer(port int) *PortServer {
 	gauge := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "promsketch_port_ingested_metrics_total",
-			Help: "Total number of ingested metrics (partitioned)",
+			Help: "Total ingested metrics per-port (partition).",
 		},
-		[]string{"metric", "machineid"},
+		[]string{"metric_name", "machineid"},
 	)
 	reg.MustRegister(gauge)
 
@@ -102,16 +109,94 @@ func NewPortServer(port int) *PortServer {
 		Port:     port,
 		Registry: reg,
 		Metrics:  gauge,
+		Raw:      make(map[string]*prometheus.GaugeVec),
 	}
 }
 
-func (ps *PortServer) Start() {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(ps.Registry, promhttp.HandlerOpts{}))
+// func (ps *PortServer) Start() {
+// 	mux := http.NewServeMux()
+// 	mux.Handle("/metrics", promhttp.HandlerFor(ps.Registry, promhttp.HandlerOpts{}))
 
-	addr := fmt.Sprintf(":%d", ps.Port)
+//		addr := fmt.Sprintf(":%d", ps.Port)
+//		go func() {
+//			log.Printf("[PORT SERVER] Serving /metrics on port %d", ps.Port)
+//			log.Fatal(http.ListenAndServe(addr, mux))
+//		}()
+//	}
+
+type RegisterPayload struct {
+	NumTargets          int `json:"num_targets"`
+	EstimatedTimeseries int `json:"estimated_timeseries"`
+	MachinesPerPort     int `json:"machines_per_port"`
+	StartPort           int `json:"start_port"`
+}
+
+// :7000/register_config
+func handleRegisterConfig(c *gin.Context) {
+	var rp RegisterPayload
+	if err := c.ShouldBindJSON(&rp); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad payload"})
+		return
+	}
+	if rp.MachinesPerPort > 0 {
+		machinesPerPort = rp.MachinesPerPort
+	}
+	if rp.StartPort > 0 {
+		startPort = rp.StartPort
+	}
+
+	needPorts := 1
+	if rp.EstimatedTimeseries > 0 && machinesPerPort > 0 {
+		needPorts = (rp.EstimatedTimeseries + machinesPerPort - 1) / machinesPerPort
+	}
+
+	portMutex.Lock()
+	for len(portServers) < needPorts {
+		p := startPort + len(portServers)
+		srv := NewPortServer(p)
+		srv.Start() // menjalankan /ingest + /metrics pada port
+		portServers = append(portServers, srv)
+		log.Printf("[PORT SERVER] Initialized /metrics and /ingest on port %d", p)
+	}
+	ports := len(portServers)
+	portMutex.Unlock()
+
+	// _ = UpdatePrometheusYML(".../prometheus.yml")??
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":            "ok",
+		"ports":             ports,
+		"machines_per_port": machinesPerPort,
+		"start_port":        startPort,
+	})
+}
+func (psv *PortServer) Start() {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(psv.Registry, promhttp.HandlerOpts{}))
+
+	// NEW: tambah handler POST /ingest pada mux port
+	mux.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var payload IngestPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if n, err := processIngest(payload); err != nil {
+			http.Error(w, "ingest failed", http.StatusInternalServerError)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, fmt.Sprintf(`{"status":"success","ingested_metrics_count":%d}`, n))
+		}
+	})
+
+	addr := fmt.Sprintf(":%d", psv.Port)
 	go func() {
-		log.Printf("[PORT SERVER] Serving /metrics on port %d", ps.Port)
+		log.Printf("[PORT SERVER] Serving /metrics and /ingest on port %d", psv.Port)
 		log.Fatal(http.ListenAndServe(addr, mux))
 	}()
 }
@@ -126,7 +211,7 @@ func getOrCreatePortIndex(machineID string) int {
 
 	portIndex := idx / machinesPerPort
 
-	// Pastikan portServers[portIndex] tersedia
+	// Ensure portServers[portIndex] is available
 	portMutex.Lock()
 	defer portMutex.Unlock()
 
@@ -135,14 +220,39 @@ func getOrCreatePortIndex(machineID string) int {
 		server := NewPortServer(port)
 		server.Start()
 		portServers = append(portServers, server)
-		log.Printf("[PORT SERVER] Initialized /metrics on port %d", port)
+		log.Printf("[PORT SERVER] Initialized /metrics and /ingest on port %d", port)
 	}
 
 	return portIndex
 }
 
+// var (
+// 	rawMetricsMap = make(map[string]*prometheus.GaugeVec)
+// 	rawMetricsMux sync.Mutex
+// )
+
+// getOrCreateRaw memastikan metric RAW terdaftar di registry port
+func (psv *PortServer) getOrCreateRaw(name string, labelKeys []string) *prometheus.GaugeVec {
+	psv.RawMux.Lock()
+	defer psv.RawMux.Unlock()
+
+	if g, ok := psv.Raw[name]; ok {
+		return g
+	}
+	g := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: name, // mis. "fake_machine_metric" dari exporter
+			Help: fmt.Sprintf("Raw metric %s ingested on partition port %d", name, psv.Port),
+		},
+		labelKeys,
+	)
+	psv.Registry.MustRegister(g)
+	psv.Raw[name] = g
+	return g
+}
+
 // ============================
-// Fungsi untuk generate prometheus config
+// Generate prometheus config
 // ============================
 const scrapeSectionTemplate = `  - job_name: "promsketch_raw_groups"
     static_configs:
@@ -198,11 +308,11 @@ func UpdatePrometheusYML(path string) error {
 
 	var newLines []string
 	if start != -1 {
-		// Ganti bagian lama
+		// Update existing scrape_configs section
 		newLines = append(lines[:start], scrapeSection...)
 		newLines = append(newLines, lines[end:]...)
 	} else {
-		// Tambahkan ke akhir scrape_configs
+		// Add to the end of scrape_configs
 		inserted := false
 		for i, line := range lines {
 			newLines = append(newLines, line)
@@ -228,15 +338,17 @@ func UpdatePrometheusYML(path string) error {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	go logIngestionRate()
 
 	router := gin.Default()
-	router.POST("/ingest", handleIngest)
+	// router.POST("/ingest", handleIngest)
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	// router.GET("/throughput_test", runStressThroughputTest)
 	router.GET("/parse", handleParse)
 	router.POST("/ingest-query-result", handleQueryResultIngest)
 	router.GET("/debug-state", handleDebugState)
+	router.POST("/register_config", handleRegisterConfig)
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
@@ -244,8 +356,8 @@ func main() {
 
 	go func() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
-		http.Handle("/metrics", promhttp.Handler())
-		log.Fatal(http.ListenAndServe(":7000", nil))
+		// http.Handle("/metrics", promhttp.Handler())
+		// log.Fatal(http.ListenAndServe(":7000", nil))
 	}()
 
 	log.Printf("PromSketch Go server listening on :7000")
@@ -266,7 +378,6 @@ func handleDebugState(c *gin.Context) {
 	foundCount := 0
 	detail := []string{}
 
-	// Kita periksa dari machine_0 hingga machine_9999
 	for i := 0; i < 10000; i++ {
 		machineID := fmt.Sprintf("machine_%d", i)
 		lsetBuilder := labels.NewBuilder(labels.Labels{})
@@ -346,52 +457,102 @@ var totalIngested int64
 // 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
 // }
 
+// func handleIngest(c *gin.Context) {
+// 	var payload IngestPayload
+// 	if err := c.ShouldBindJSON(&payload); err != nil {
+// 		log.Printf("Error binding JSON payload: %v", err)
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
+// 		return
+// 	}
+
+// 	start := time.Now()
+// 	var wg sync.WaitGroup
+// 	sem := make(chan struct{}, maxIngestGoroutines)
+
+// 	for _, metric := range payload.Metrics {
+// 		wg.Add(1)
+// 		sem <- struct{}{}
+
+// 		go func(metric MetricPayload) {
+// 			defer wg.Done()
+// 			defer func() { <-sem }()
+
+// 			// ========== ORIGINAL (Spesific machine id) ==========
+// 			lsetBuilder := labels.NewBuilder(labels.Labels{})
+// 			for k, v := range metric.Labels {
+// 				lsetBuilder.Set(k, v)
+// 			}
+// 			lsetBuilder.Set(labels.MetricName, metric.Name)
+// 			lsetOriginal := lsetBuilder.Labels()
+
+// 			if err := ps.SketchInsert(lsetOriginal, payload.Timestamp, metric.Value); err == nil {
+// 				atomic.AddInt64(&totalIngested, 1)
+// 				ingestedMetrics.WithLabelValues(metric.Name, metric.Labels["machineid"]).Set(metric.Value)
+
+// 				// Add to registry per-port
+// 				machineID := metric.Labels["machineid"]
+// 				if machineID != "" {
+// 					portIndex := getOrCreatePortIndex(machineID)
+// 					if portIndex < len(portServers) {
+// 						portServers[portIndex].Metrics.WithLabelValues(metric.Name, machineID).Set(metric.Value)
+// 					}
+// 				}
+// 			}
+// 			// ====== RAW DATA EXPORTER ======
+// 			labelKeys := []string{}
+// 			labelVals := []string{}
+// 			for k, v := range metric.Labels {
+// 				labelKeys = append(labelKeys, k)
+// 				labelVals = append(labelVals, v)
+// 			}
+// 			rawGauge := getOrCreateRawMetric(metric.Name, labelKeys)
+// 			rawGauge.WithLabelValues(labelVals...).Set(metric.Value)
+
+// 			// ========== GLOBAL (without machineid) ==========
+// 			lsetGlobalBuilder := labels.NewBuilder(labels.Labels{})
+// 			for k, v := range metric.Labels {
+// 				if k != "machineid" {
+// 					lsetGlobalBuilder.Set(k, v)
+// 				}
+// 			}
+// 			lsetGlobalBuilder.Set(labels.MetricName, metric.Name)
+// 			lsetGlobal := lsetGlobalBuilder.Labels()
+
+// 			if err := ps.SketchInsert(lsetGlobal, payload.Timestamp, metric.Value); err == nil {
+// 				atomic.AddInt64(&totalIngested, 1)
+// 				ingestedMetrics.WithLabelValues(metric.Name, "global").Set(metric.Value)
+// 			}
+// 		}(metric)
+// 	}
+
+// 	wg.Wait()
+
+// 	// Automaticly update prometheus.yml
+// 	now := time.Now()
+// 	if now.Sub(lastYMLUpdate) > 10*time.Second {
+// 		ymlPath := "./prometheus/documentation/examples/prometheus.yml"
+// 		if err := UpdatePrometheusYML(ymlPath); err != nil {
+// 			log.Printf("Failed to update Prometheus config: %v", err)
+// 		} else {
+// 			log.Printf("Updated Prometheus config at %s", ymlPath)
+// 			lastYMLUpdate = now
+// 		}
+// 	}
+
+// 	totalDuration := time.Since(start).Milliseconds()
+// 	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
+
+// 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
+// }
+
 func handleIngest(c *gin.Context) {
 	var payload IngestPayload
 	if err := c.ShouldBindJSON(&payload); err != nil {
-		log.Printf("Error binding JSON payload: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
 		return
 	}
-
-	start := time.Now()
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxIngestGoroutines)
-
-	for _, metric := range payload.Metrics {
-		wg.Add(1)
-		sem <- struct{}{} // acquire slot
-
-		go func(metric MetricPayload) {
-			defer wg.Done()
-			defer func() { <-sem }() // release slot
-
-			lsetBuilder := labels.NewBuilder(labels.Labels{})
-			for k, v := range metric.Labels {
-				lsetBuilder.Set(k, v)
-			}
-			lsetBuilder.Set(labels.MetricName, metric.Name)
-			lset := lsetBuilder.Labels()
-
-			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err == nil {
-				atomic.AddInt64(&totalIngested, 1)
-				ingestedMetrics.WithLabelValues(metric.Name, metric.Labels["machineid"]).Set(metric.Value)
-
-				// Tambahan sinkronisasi ke registry per port
-				machineID := metric.Labels["machineid"]
-				if machineID != "" {
-					portIndex := getOrCreatePortIndex(machineID)
-					if portIndex < len(portServers) {
-						portServers[portIndex].Metrics.WithLabelValues(metric.Name, machineID).Set(metric.Value)
-					}
-				}
-			}
-		}(metric)
-	}
-
-	wg.Wait()
-
-	// ✅ Update prometheus.yml setelah semua port aktif
+	_, _ = processIngest(payload)
+	// Automaticly update prometheus.yml
 	now := time.Now()
 	if now.Sub(lastYMLUpdate) > 10*time.Second {
 		ymlPath := "./prometheus/documentation/examples/prometheus.yml"
@@ -402,14 +563,83 @@ func handleIngest(c *gin.Context) {
 			lastYMLUpdate = now
 		}
 	}
-
-	totalDuration := time.Since(start).Milliseconds()
-	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
-
 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
 }
 
-// menerima hasil query dari promtools.py
+func processIngest(payload IngestPayload) (int, error) {
+	start := time.Now()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxIngestGoroutines)
+
+	for _, metric := range payload.Metrics {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(metric MetricPayload) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// ========== ORIGINAL (Spesific machine id) ==========
+			// lset original (per machineid)
+			lsetBuilder := labels.NewBuilder(labels.Labels{})
+			for k, v := range metric.Labels {
+				lsetBuilder.Set(k, v)
+			}
+			lsetBuilder.Set(labels.MetricName, metric.Name)
+			lsetOriginal := lsetBuilder.Labels()
+			// INSERT to sketch global ‘ps’
+			if err := ps.SketchInsert(lsetOriginal, payload.Timestamp, metric.Value); err == nil {
+				atomic.AddInt64(&totalIngested, 1)
+				ingestedMetrics.WithLabelValues(metric.Name, metric.Labels["machineid"]).Set(metric.Value)
+
+				// Add to registry per-port
+				machineID := metric.Labels["machineid"]
+				if machineID != "" {
+					portIndex := getOrCreatePortIndex(machineID)
+					if portIndex < len(portServers) {
+						portServers[portIndex].Metrics.WithLabelValues(metric.Name, machineID).Set(metric.Value)
+					}
+				}
+			}
+			// ====== RAW DATA EXPORTER — per-port ======
+			labelKeys := make([]string, 0, len(metric.Labels))
+			for k := range metric.Labels {
+				labelKeys = append(labelKeys, k)
+			}
+			sort.Strings(labelKeys)
+			labelVals := make([]string, 0, len(labelKeys))
+			for _, k := range labelKeys {
+				labelVals = append(labelVals, metric.Labels[k])
+			}
+
+			// Tentukan port dari machineid, lalu update RAW di registry port tsb
+			portIndex := getOrCreatePortIndex(metric.Labels["machineid"])
+			if portIndex < len(portServers) {
+				raw := portServers[portIndex].getOrCreateRaw(metric.Name, labelKeys)
+				raw.WithLabelValues(labelVals...).Set(metric.Value)
+			}
+
+			// ========== GLOBAL (without machineid) ==========
+			lsetGlobalBuilder := labels.NewBuilder(labels.Labels{})
+			for k, v := range metric.Labels {
+				if k != "machineid" {
+					lsetGlobalBuilder.Set(k, v)
+				}
+			}
+			lsetGlobalBuilder.Set(labels.MetricName, metric.Name)
+			lsetGlobal := lsetGlobalBuilder.Labels()
+
+			if err := ps.SketchInsert(lsetGlobal, payload.Timestamp, metric.Value); err == nil {
+				atomic.AddInt64(&totalIngested, 1)
+				ingestedMetrics.WithLabelValues(metric.Name, "global").Set(metric.Value)
+			}
+		}(metric)
+	}
+	wg.Wait()
+	totalDuration := time.Since(start).Milliseconds()
+	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
+	return len(payload.Metrics), nil
+}
+
+// Rechieved query results from promtools.py
 func handleQueryResultIngest(c *gin.Context) {
 	var result struct {
 		Function       string  `json:"function"`
@@ -628,13 +858,26 @@ func handleParse(c *gin.Context) {
 		return
 	}
 
-	if len(call.Args) > 1 {
+	if funcName == "quantile_over_time" {
+		if len(call.Args) < 2 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "quantile_over_time requires two arguments: a number and a range vector"})
+			return
+		}
 		firstArg, ok := call.Args[0].(*parser.NumberLiteral)
 		if !ok {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Numeric argument (like quantile) must be a number"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "First argument of quantile_over_time must be a number"})
+			return
+		}
+		if firstArg.Val < 0 || firstArg.Val > 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Quantile must be between 0 and 1"})
 			return
 		}
 		otherArgs = firstArg.Val
+	} else if len(call.Args) > 1 {
+		firstArg, ok := call.Args[0].(*parser.NumberLiteral)
+		if ok {
+			otherArgs = firstArg.Val
+		}
 	}
 
 	vs, ok := rangeArg.VectorSelector.(*parser.VectorSelector)

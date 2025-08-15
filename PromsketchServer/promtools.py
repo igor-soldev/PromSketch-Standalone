@@ -2,6 +2,8 @@ import yaml
 import requests
 import urllib.parse
 import time
+import signal
+import sys
 
 RULES_FILE = "/mnt/78D8516BD8512920/GARUDA_ACE/FROOT-LAB/promsketch-standalone/PromsketchServer/prometheus/documentation/examples/prometheus-rules.yml"
 SERVER_URL = "http://localhost:7000/parse?q="
@@ -10,7 +12,6 @@ def load_rules(path):
     with open(path, "r") as f:
         data = yaml.safe_load(f)
     return data.get("rules", [])
-
 
 def run_query(query_str):
     encoded = urllib.parse.quote(query_str)
@@ -32,11 +33,10 @@ def run_query(query_str):
                 value = entry.get("value")
                 timestamp = entry.get("timestamp")
 
-                # Extract metadata from query string
                 func = query_str.split("(")[0]
                 metric = query_str.split("(")[1].split("{")[0]
                 machineid = query_str.split('machineid="')[1].split('"')[0]
-                quantile = "0.00"  # default
+                quantile = "0.00"
                 if "_" in func:
                     parts = func.split("_")
                     if parts[0].replace(".", "", 1).isdigit():
@@ -69,21 +69,28 @@ def push_result_to_server(func, metric, machineid, quantile, value, timestamp):
     except Exception as e:
         print(f"[FAIL] Exception while pushing result: {e}")
 
+def signal_handler(sig, frame):
+    print("\n[INFO] Program dihentikan oleh user.")
+    sys.exit(0)
+
 def main():
+    signal.signal(signal.SIGINT, signal_handler)
+
     rules = load_rules(RULES_FILE)
     if not rules:
         print("No rules found in rules.yml")
         return
 
-    for rule in rules:
-        name = rule.get("name", "Unnamed")
-        query = rule.get("query")
-        if not query:
-            print(f"Skipping rule '{name}': No query specified")
-            continue
-        print(f"\n=== Running Rule: {name} ===")
-        run_query(query)
-        time.sleep(1)  # optional delay
+    while True:
+        for rule in rules:
+            name = rule.get("name", "Unnamed")
+            query = rule.get("query")
+            if not query:
+                print(f"Skipping rule '{name}': No query specified")
+                continue
+            print(f"\n=== Running Rule: {name} ===")
+            run_query(query)
+        time.sleep(5)  # update setiap 5 detik
 
 if __name__ == "__main__":
     main()

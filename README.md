@@ -122,6 +122,6 @@ You can benchmark ingestion and query execution as follows:
 
 * **Multiport ingestion endpoints** handle raw data ingestion and forward metrics directly to Prometheus.
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
-* Prometheus TSDB retains previously scraped data even if the server stops, but new queries require the main server.
 
 ---
+

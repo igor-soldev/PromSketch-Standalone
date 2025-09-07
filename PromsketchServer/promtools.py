@@ -59,48 +59,9 @@ def run_query(query_str):
         print(f"Failed to send query: {e}")
 
 
+
 def push_result_to_server(func, metric, machineid, quantile, value, timestamp,
-                          client_latency_ms, server_latency_ms):
-    body = {
-        "function": func,
-        "original_metric": metric,
-        "machineid": machineid,
-        "quantile": quantile,
-        "value": value,
-        "timestamp": timestamp,
-        "client_latency_ms": client_latency_ms,
-        "server_latency_ms": server_latency_ms,
-    }
-    try:
-        res = requests.post("http://localhost:7000/ingest-query-result", json=body)
-        if res.status_code == 200:
-            print("[SUCCESS] Pushed result to server")
-        else:
-            print("[FAIL] Failed to push result:", res.text)
-    except Exception as e:
-        print(f"[FAIL] Exception while pushing result: {e}")
-
-
-def push_result_to_server(func, metric, machineid, quantile, value, timestamp, client_latency_ms):
-    body = {
-        "function": func,
-        "original_metric": metric,
-        "machineid": machineid,
-        "quantile": quantile,
-        "value": value,
-        "timestamp": timestamp,
-        "client_latency_ms": client_latency_ms,  # <— tambahan
-    }
-    try:
-        res = requests.post("http://localhost:7000/ingest-query-result", json=body)
-        if res.status_code == 200:
-            print("[SUCCESS] Pushed result to server")
-        else:
-            print("[FAIL] Failed to push result:", res.text)
-    except Exception as e:
-        print(f"[FAIL] Exception while pushing result: {e}")
-
-def push_result_to_server(func, metric, machineid, quantile, value, timestamp):
+                          client_latency_ms=None, server_latency_ms=None):
     body = {
         "function": func,
         "original_metric": metric,
@@ -109,14 +70,11 @@ def push_result_to_server(func, metric, machineid, quantile, value, timestamp):
         "value": value,
         "timestamp": timestamp,
     }
-    try:
-        res = requests.post("http://localhost:7000/ingest-query-result", json=body)
-        if res.status_code == 200:
-            print("[SUCCESS] Pushed result to server")
-        else:
-            print("[FAIL] Failed to push result:", res.text)
-    except Exception as e:
-        print(f"[FAIL] Exception while pushing result: {e}")
+    if client_latency_ms is not None:
+        body["client_latency_ms"] = client_latency_ms
+    if server_latency_ms is not None:
+        body["server_latency_ms"] = server_latency_ms
+    requests.post("http://localhost:7000/ingest-query-result", json=body)
 
 def signal_handler(sig, frame):
     print("\n[INFO] Program dihentikan oleh user.")

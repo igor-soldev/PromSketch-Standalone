@@ -103,6 +103,8 @@ async def post_with_retry(session, url, payload, retries=2):
             await asyncio.sleep(0.2 * (attempt + 1))
     raise last_err
 
+# ... kode sebelum ini tetap ...
+
 async def ingest_loop(config_file):
     global total_sent
 
@@ -117,11 +119,10 @@ async def ingest_loop(config_file):
 
     targets = config_data["scrape_configs"][0]["static_configs"][0]["targets"]
     num_targets = len(targets)
-    MAX_BATCH_SIZE = num_targets * metrics_per_target
+    # MAX_BATCH_SIZE = num_targets * metrics_per_target
 
     print(f"[CONFIG] metrics_per_target = {metrics_per_target}")
-    print(f"[CONFIG] MAX_BATCH_SIZE = {MAX_BATCH_SIZE}")
-    print(f"[CONFIG] BATCH_SEND_INTERVAL_SECONDS = {BATCH_SEND_INTERVAL_SECONDS}")
+    # print(f"[CONFIG] MAX_BATCH_SIZE = {MAX_BATCH_SIZE}")
     print(f"[ROUTING] BASE_PORT={PROMSKETCH_BASE_PORT} MACHINES_PER_PORT={MACHINES_PER_PORT}")
 
     scrape_interval_str = config_data["scrape_configs"][0].get("scrape_interval", "10s")
@@ -131,11 +132,7 @@ async def ingest_loop(config_file):
             interval_seconds = 1
     except Exception as e:
         print(f"Invalid scrape_interval: {e}")
-        interval_seconds = 10
-
-# Setiap siklus scrape (interval dari file yml), ingester mengumpulkan sample ke metrics_buffer
-    metrics_buffer = []
-    last_send_time = time.time()
+        interval_seconds = 1
 
     asyncio.create_task(log_speed())
 
@@ -145,26 +142,20 @@ async def ingest_loop(config_file):
             tasks = [fetch_metrics(session, target) for target in targets]
             results = await asyncio.gather(*tasks)
 
+            metrics_buffer = []
             for metric_list in results:
                 metrics_buffer.extend(metric_list)
 
-            now = time.time()
-            should_send = metrics_buffer and (
-                len(metrics_buffer) >= MAX_BATCH_SIZE or
-                (now - last_send_time) > BATCH_SEND_INTERVAL_SECONDS
-            )
-
-            if should_send:
-                # Kelompokkan payload per port tujuan
+            # Langsung kirim semua metrics hasil fetch setiap interval
+            if metrics_buffer:
                 buckets = {}
                 for m in metrics_buffer:
                     mid = m["Labels"].get("machineid", "machine_0")
                     port = machine_to_port(mid)
-                    if port in PORT_BLOCKLIST:            # <— NEW: guard anti-7000
+                    if port in PORT_BLOCKLIST:
                         port = PROMSKETCH_BASE_PORT
                     buckets.setdefault(port, []).append(m)
 
-                # Kirim per bucket ke /ingest masing-masing
                 for port, items in sorted(buckets.items()):
                     url = f"http://localhost:{port}/ingest"
                     payload = {"Timestamp": current_scrape_time, "Metrics": items}
@@ -177,9 +168,6 @@ async def ingest_loop(config_file):
                             print(f"[SEND ERR {status}] {url} → {body[:200]}")
                     except Exception as e:
                         print(f"[SEND EXC] {url}: {e}")
-
-                metrics_buffer = []
-                last_send_time = time.time()
 
             await asyncio.sleep(interval_seconds)
 

@@ -14,7 +14,7 @@ PROMSKETCH_QUERY_URL = "http://localhost:7000/parse?q="
 REFRESH_SEC = 2
 HISTORY_LEN = 120  # simpan 120 titik (sliding window)
 
-# --- daftar ekspresi yang dibandingkan (pakai PromQL yang sama di kedua sisi) ---
+# --- daftar ekspresi yang dibandingkan (pakai PromQL yang sama di kedua sisi) --- 10000s
 QUERY_EXPRS = {
     "0.5-Quantile": 'quantile_over_time(0.5, fake_machine_metric{machineid="machine_0"}[10000s])',
     "0.9-Quantile": 'quantile_over_time(0.9, fake_machine_metric{machineid="machine_0"}[10000s])',

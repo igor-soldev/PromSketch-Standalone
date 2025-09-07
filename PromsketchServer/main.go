@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,8 +25,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/zzylol/prometheus-sketches/model/labels"
-	"github.com/zzylol/prometheus-sketches/promql/parser"
+	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/model/labels"
+	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/promql/parser"
 )
 
 type IngestPayload struct {
@@ -65,22 +66,6 @@ var maxIngestGoroutines int
 func init() {
 	ps = promsketch.NewPromSketches()
 	log.Println("PromSketches instance initialized")
-	// Mode kompatibel Prometheus (per-bucket)
-	if v := os.Getenv("PROMSKETCH_MODE"); v != "" {
-		if strings.EqualFold(v, "prometheus") || v == "1" || strings.EqualFold(v, "compat") {
-			promsketch.PrometheusMode = true
-			log.Printf("[MODE] Prometheus-compatible ON")
-		}
-	}
-
-	// Ukuran bucket scrape (ms)
-	if v := os.Getenv("PROMSKETCH_SCRAPE_MS"); v != "" {
-		if ms, err := strconv.ParseInt(v, 10, 64); err == nil && ms > 0 {
-			promsketch.ScrapeBucketMs = ms
-			log.Printf("[MODE] Scrape bucket = %d ms", ms)
-		}
-	}
-
 	val := os.Getenv("MAX_INGEST_GOROUTINES")
 	if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
 		maxIngestGoroutines = parsed
@@ -425,6 +410,85 @@ func handleDebugState(c *gin.Context) {
 	}
 }
 
+// Tambahkan fungsi helper debug di bawah deklarasi import:
+// func debugSampleIngested(metric string, value float64, labels map[string]string, ts int64) {
+// 	log.Printf("[DEBUG-INGEST] metric=%s value=%f labels=%v timestamp=%d", metric, value, labels, ts)
+// }
+
+func debugAggregationResult(fname string, lset map[string]string, mint, maxt int64, result float64, count float64) {
+	// log.Printf("[DEBUG-AGG] function=%s labels=%v mint=%d maxt=%d result=%f count=%f", fname, lset, mint, maxt, result, count)
+	// Simpan ke file CSV juga (opsional)
+	f, err := os.OpenFile("debug_agg_log.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		w := csv.NewWriter(f)
+		defer func() { w.Flush(); f.Close() }()
+		_ = w.Write([]string{
+			time.Now().Format(time.RFC3339),
+			fname,
+			fmt.Sprintf("%v", lset),
+			fmt.Sprintf("%d", mint),
+			fmt.Sprintf("%d", maxt),
+			fmt.Sprintf("%f", result),
+			fmt.Sprintf("%f", count),
+		})
+	}
+}
+func debugExecSamples(fname string, lset labels.Labels, mint, maxt, curTime int64, sampleCount float64) {
+	log.Printf("[DEBUG-EXEC] function=%s metric=%s machineid=%s mint=%d maxt=%d cur=%d sample_count=%.0f",
+		fname, lset.Get("__name__"), lset.Get("machineid"), mint, maxt, curTime, sampleCount)
+
+	f, err := os.OpenFile("debug_exec_sketches.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		w := csv.NewWriter(f)
+		_ = w.Write([]string{
+			time.Now().Format(time.RFC3339),
+			fname,
+			lset.Get("__name__"),
+			lset.Get("machineid"),
+			fmt.Sprintf("%d", mint),
+			fmt.Sprintf("%d", maxt),
+			fmt.Sprintf("%d", curTime),
+			fmt.Sprintf("%.0f", sampleCount),
+		})
+		w.Flush()
+		_ = f.Close()
+	}
+}
+func debugWindowCounts(
+	fname string,
+	lset labels.Labels,
+	promMint, promMaxt, pskMint, pskMaxt int64,
+	promCount, pskCount float64,
+) {
+	log.Printf("[DEBUG COUNT] function=%s metric=%s machineid=%s | PROMETHEUS mint=%d maxt=%d count=%.0f | PROMSKETCH mint=%d maxt=%d count=%.0f",
+		fname, lset.Get("__name__"), lset.Get("machineid"),
+		promMint, promMaxt, promCount, pskMint, pskMaxt, pskCount,
+	)
+
+	f, err := os.OpenFile("debug_window_counts.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		// tulis header jika file masih kosong
+		if info, _ := f.Stat(); info.Size() == 0 {
+			_, _ = f.WriteString("timestamp,function,metric,machineid,prom_mint,prom_maxt,prom_count,psk_mint,psk_maxt,psk_count\n")
+		}
+		w := csv.NewWriter(f)
+		_ = w.Write([]string{
+			time.Now().Format(time.RFC3339),
+			fname,
+			lset.Get("__name__"),
+			lset.Get("machineid"),
+			fmt.Sprintf("%d", promMint),
+			fmt.Sprintf("%d", promMaxt),
+			fmt.Sprintf("%.0f", promCount),
+			fmt.Sprintf("%d", pskMint),
+			fmt.Sprintf("%d", pskMaxt),
+			fmt.Sprintf("%.0f", pskCount),
+		})
+		w.Flush()
+		_ = f.Close()
+	}
+}
+
 var totalIngested int64
 
 // func handleIngest(c *gin.Context) {
@@ -592,6 +656,7 @@ func processIngest(payload IngestPayload) (int, error) {
 		go func(metric MetricPayload) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// debugSampleIngested(metric.Name, metric.Value, metric.Labels, payload.Timestamp)
 			// ========== ORIGINAL (Spesific machine id) ==========
 			// lset original (per machineid)
 			lsetBuilder := labels.NewBuilder(labels.Labels{})
@@ -973,7 +1038,26 @@ func handleParse(c *gin.Context) {
 	}
 
 	mint, maxt = t1, t2
+	// DEBUG: Log window penyesuaian PromSketch vs Prometheus
+	log.Printf("[DEBUG WINDOW] Prometheus requested window: mint=%d maxt=%d (durasi=%d ms)", maxt-queryDuration.Milliseconds(), maxt, queryDuration.Milliseconds())
+	log.Printf("[DEBUG WINDOW] PromSketch final window:     mint=%d maxt=%d (durasi=%d ms)", mint, maxt, maxt-mint)
+	// ----- SAMPLE COUNT untuk 2 window -----
+	// Prometheus requested window: panjang W berakhir di 'maxt' (yang sudah diselaraskan)
+	promMint := maxt - W
+	promMaxt := maxt
 
+	var promCount float64 = math.NaN()
+	if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, promMint, promMaxt, promMaxt); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+		promCount = cntVec[0].F
+	}
+
+	var pskCount float64 = math.NaN()
+	if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, mint, maxt, maxt); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+		pskCount = cntVec[0].F
+	}
+
+	// Log ke console & CSV
+	debugWindowCounts(funcName, lset, promMint, promMaxt, mint, maxt, promCount, pskCount)
 	// Validasi akhir
 	if maxt <= mint {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -989,6 +1073,7 @@ func handleParse(c *gin.Context) {
 
 	startEval := time.Now()
 	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
+
 	// Print every exec steps
 	evalLatency := time.Since(startEval)
 
@@ -1017,17 +1102,44 @@ func handleParse(c *gin.Context) {
 			).Set(sample.F)
 		}
 	}
+	needsExecCount := funcName == "l1_over_time" || funcName == "l2_over_time" ||
+		funcName == "distinct_over_time" || funcName == "entropy_over_time"
 
+	var execCount float64 = math.NaN()
+	if needsExecCount {
+		// Jalankan second pass: count_over_time(...) pada window final PromSketch
+		if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, mint, maxt, curTime); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+			execCount = cntVec[0].F
+		}
+		// Log + CSV
+		debugExecSamples(funcName, lset, mint, maxt, curTime, execCount)
+	}
+
+	// --- build response ---
 	log.Printf("[QUERY ENGINE] Evaluation successful. Returning %d data points.", len(results))
 	response := gin.H{
 		"status":           "success",
 		"data":             results,
-		"query_latency_ms": float64(evalLatency.Microseconds()) / 1000.0, // presisi ms (float)
-	}
-	if len(annotations) > 0 {
-		response["annotations"] = annotations
+		"query_latency_ms": float64(evalLatency.Microseconds()) / 1000.0,
 	}
 
+	// --- MERGE/ADD annotations agar klien bisa baca window & sample count ---
+	respAnn := gin.H{}
+	for k, v := range annotations {
+		respAnn[k] = v
+	}
+	respAnn["exec_window"] = gin.H{"mint": mint, "maxt": maxt, "cur": curTime}
+	if needsExecCount && !math.IsNaN(execCount) {
+		respAnn["sketch_exec_sample_count"] = execCount
+	}
+	if len(respAnn) > 0 {
+		response["annotations"] = respAnn
+	}
+	respAnn["prometheus_request_window"] = gin.H{"mint": promMint, "maxt": promMaxt}
+	respAnn["prometheus_sample_count"] = promCount
+	respAnn["promsketch_sample_count"] = pskCount
+
+	// (kode existing untuk debugAggregationResult dll tetap)
 	c.JSON(http.StatusOK, response)
 }
 

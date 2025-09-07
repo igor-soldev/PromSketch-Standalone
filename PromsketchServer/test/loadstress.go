@@ -105,7 +105,7 @@ import (
 
 	"github.com/SieDeta/promsketch_std/promsketch"
 
-	"github.com/zzylol/prometheus-sketches/model/labels"
+	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/model/labels"
 )
 
 const (

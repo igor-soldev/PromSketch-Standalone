@@ -1,4 +1,8 @@
-# Initial Environment Setup
+# Standalone PromSketch
+
+This repository provides a standalone PromSketch version, which scrapes samples from Prometheus exporters, caches rule queries as intermediate sketches in [PromSketch](https://github.com/Froot-NetSys/promsketch), and forwards all raw samples to Prometheus for backup. 
+
+## Initial Environment Setup
 
 1. Create and activate a Python virtual environment, then install the required dependencies.
    ```bash
@@ -13,13 +17,13 @@
    ```
 2. Download the CAIDA dataset and use `ExporterStarter/datasets/pcap_process.py` to convert it into `.txt` format.
 
-# PromSketch Standalone Server – Setup and Testing Guide
+## PromSketch Standalone Server – Setup and Testing Guide
 
 This repository contains the implementation of **PromSketch**, a sketch-based time series processing server, along with supporting tools for ingestion, query testing, visualization, and performance benchmarking.
 
 ---
 
-## Components
+### Components
 
 * **Main Server**
   Path: `ProsmketchServer/main.go`
@@ -39,9 +43,9 @@ This repository contains the implementation of **PromSketch**, a sketch-based ti
 
 ---
 
-## Step-by-Step Testing Instructions
+### Step-by-Step Running Instructions
 
-### 1. Start the Export Manager and Custom Ingester
+#### 1. Start the Export Manager and Custom Ingester
 
 Inside `ExporterStarter/`, run the following to generate and ingest synthetic data:
 
@@ -63,7 +67,7 @@ python3 custom_ingester.py --config=num_samples_config.yml
 
 ---
 
-### 2. Launch the Main PromSketch Server
+#### 2. Launch the Main PromSketch Server
 
 From `ProsmketchServer/`, run:
 
@@ -78,7 +82,7 @@ MAX_INGEST_GOROUTINES=n go run .
 
 ---
 
-### 3. Start Prometheus
+#### 3. Start Prometheus
 
 From the Prometheus build directory:
 
@@ -92,7 +96,7 @@ cd ProsmketchServer/prometheus/
 
 ---
 
-### 4. Run PromTools for Query Testing
+#### 4. Run PromTools for Query Testing
 
 Run PromTools from `ProsmketchServer/` to continuously send PromQL queries:
 
@@ -106,7 +110,7 @@ Queries such as `avg_over_time`, `entropy_over_time`, and `quantile_over_time` w
 
 ---
 
-### 5. Visualize with Grafana
+#### 5. Visualize with Grafana
 
 * Connect Grafana to your Prometheus instance.
 * Create dashboards and panels to display ingested metrics and query outputs.
@@ -114,7 +118,7 @@ Queries such as `avg_over_time`, `entropy_over_time`, and `quantile_over_time` w
 
 ---
 
-## Performance Testing
+### Performance Testing
 
 You can benchmark ingestion and query execution as follows:
 
@@ -133,11 +137,12 @@ You can benchmark ingestion and query execution as follows:
 
 ---
 
-## Notes
+### Notes
 
 * **Multiport ingestion endpoints** handle raw data ingestion and forward metrics directly to Prometheus.
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 

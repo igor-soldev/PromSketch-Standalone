@@ -24,9 +24,11 @@ import (
 	"github.com/Froot-NetSys/Promsketch-Standalone/promsketch"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/model/labels"
 	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/promql/parser"
+	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/util/annotations"
 )
 
 type IngestPayload struct {
@@ -40,12 +42,45 @@ type MetricPayload struct {
 	Value  float64           `json:"value"`
 }
 
+const (
+	machineIDLabel = "machineid"
+)
+
+type serverConfig struct {
+	disableInsert bool
+	disableQuery  bool
+	remoteWriter  *remoteWriter
+}
+
+type serverDefaults struct {
+	disableInsert       bool
+	disableQuery        bool
+	remoteWriteEndpoint string
+	remoteWriteTimeout  time.Duration
+}
+
 var ps *promsketch.PromSketches
 var cloudEndpoint = os.Getenv("FORWARD_ENDPOINT")
+var cfg serverConfig
+var defaults = serverDefaults{
+	disableInsert:       false,
+	disableQuery:        false,
+	remoteWriteEndpoint: "http://localhost:9090/api/v1/write",
+	remoteWriteTimeout:  5 * time.Second,
+}
+
+type ingestionSnapshot struct {
+	Rate        float64   `json:"rate_per_sec"`
+	AvgRate     float64   `json:"avg_rate_per_sec"`
+	Total       int64     `json:"total_ingested"`
+	Samples     int64     `json:"samples_in_interval"`
+	IntervalSec float64   `json:"interval_seconds"`
+	Timestamp   time.Time `json:"timestamp"`
+}
 
 var (
-	ingestedMetrics = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	ingestedMetrics = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
 			Name: "promsketch_ingested_metrics_total",
 			Help: "Total number of ingested metrics",
 		},
@@ -60,8 +95,28 @@ var (
 		[]string{"function", "original_metric", "machineid", "quantile"},
 	)
 )
+var (
+	queryDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "promsketch_query_duration_seconds",
+			Help:    "Total PromSketch query handler latency in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"func", "aggregate", "status"},
+	)
+
+	queryEvalDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "promsketch_eval_duration_seconds",
+			Help:    "Time spent inside ps.Eval/EvalAggregate in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"func", "aggregate", "status"},
+	)
+)
 
 var maxIngestGoroutines int
+var lastIngestionStats atomic.Value
 
 func init() {
 	ps = promsketch.NewPromSketches()
@@ -75,23 +130,73 @@ func init() {
 
 	prometheus.MustRegister(ingestedMetrics)
 	prometheus.MustRegister(queryResults)
+	lastIngestionStats.Store(ingestionSnapshot{})
+
+	cfg.disableInsert = defaults.disableInsert
+	envDisableInsert, hasEnvDisableInsert := readBoolEnv("PROMSKETCH_DISABLE_INSERT")
+	if hasEnvDisableInsert {
+		cfg.disableInsert = envDisableInsert
+	}
+	if cfg.disableInsert {
+		source := "defaults"
+		if hasEnvDisableInsert {
+			source = "PROMSKETCH_DISABLE_INSERT"
+		}
+		log.Printf("[CONFIG] Sketch insertion disabled (%s)", source)
+	}
+
+	cfg.disableQuery = defaults.disableQuery
+	envDisableQuery, hasEnvDisableQuery := readBoolEnv("PROMSKETCH_DISABLE_QUERY")
+	if hasEnvDisableQuery {
+		cfg.disableQuery = envDisableQuery
+	}
+	if cfg.disableQuery {
+		source := "defaults"
+		if hasEnvDisableQuery {
+			source = "PROMSKETCH_DISABLE_QUERY"
+		}
+		log.Printf("[CONFIG] Query endpoint disabled (%s)", source)
+	}
+	endpoint := strings.TrimSpace(defaults.remoteWriteEndpoint)
+	if envEndpoint := strings.TrimSpace(os.Getenv("PROMSKETCH_REMOTE_WRITE_ENDPOINT")); envEndpoint != "" {
+		endpoint = envEndpoint
+	}
+	if endpoint != "" {
+		timeout := defaults.remoteWriteTimeout
+		if raw := strings.TrimSpace(os.Getenv("PROMSKETCH_REMOTE_WRITE_TIMEOUT")); raw != "" {
+			if parsed, err := time.ParseDuration(raw); err == nil {
+				timeout = parsed
+			} else {
+				log.Printf("[CONFIG] Failed to parse PROMSKETCH_REMOTE_WRITE_TIMEOUT (%s): %v. Using default %s", raw, err, timeout)
+			}
+		}
+		cfg.remoteWriter = newRemoteWriter(endpoint, timeout)
+		log.Printf("[REMOTE WRITE] Enabled forwarding to %s (timeout=%s)", endpoint, timeout)
+	}
 }
 
+const (
+	defaultStartPort         = 7100
+	defaultMachinesPerPort   = 200
+	prometheusConfigPath     = "./prometheus/documentation/examples/prometheus.yml"
+	promConfigUpdateInterval = 10 * time.Second
+)
+
 var (
-	portServers     []*PortServer
-	portMutex       sync.Mutex
-	startPort       = 7100
-	machinesPerPort = 200
-	lastYMLUpdate   time.Time
+	portServers          []*PortServer
+	portMutex            sync.Mutex
+	startPort            = defaultStartPort
+	machinesPerPort      = defaultMachinesPerPort
+	throughputAvgWindow  = readIntEnv("PROMSKETCH_THROUGHPUT_AVG_WINDOW", 5)
+	lastPromConfigUpdate time.Time
 )
 
 type PortServer struct {
 	Port     int
 	Registry *prometheus.Registry
 	Metrics  *prometheus.GaugeVec
-	// RAW per-port
-	Raw    map[string]*prometheus.GaugeVec
-	RawMux sync.Mutex
+	Raw      map[string]*prometheus.GaugeVec // raw per-port metrics exposed for scraping
+	RawMux   sync.Mutex
 }
 
 func NewPortServer(port int) *PortServer {
@@ -116,13 +221,12 @@ func NewPortServer(port int) *PortServer {
 // func (ps *PortServer) Start() {
 // 	mux := http.NewServeMux()
 // 	mux.Handle("/metrics", promhttp.HandlerFor(ps.Registry, promhttp.HandlerOpts{}))
-
-//		addr := fmt.Sprintf(":%d", ps.Port)
-//		go func() {
-//			log.Printf("[PORT SERVER] Serving /metrics on port %d", ps.Port)
-//			log.Fatal(http.ListenAndServe(addr, mux))
-//		}()
-//	}
+// 	addr := fmt.Sprintf(":%d", ps.Port)
+// 	go func() {
+// 		log.Printf("[PORT SERVER] Serving /metrics on port %d", ps.Port)
+// 		log.Fatal(http.ListenAndServe(addr, mux))
+// 	}()
+// }
 
 type RegisterPayload struct {
 	NumTargets          int `json:"num_targets"`
@@ -131,7 +235,7 @@ type RegisterPayload struct {
 	StartPort           int `json:"start_port"`
 }
 
-// :7000/register_config
+// handleRegisterConfig (/register_config) provisions per-port ingest servers.
 func handleRegisterConfig(c *gin.Context) {
 	var rp RegisterPayload
 	if err := c.ShouldBindJSON(&rp); err != nil {
@@ -154,14 +258,12 @@ func handleRegisterConfig(c *gin.Context) {
 	for len(portServers) < needPorts {
 		p := startPort + len(portServers)
 		srv := NewPortServer(p)
-		srv.Start() // menjalankan /ingest + /metrics pada port
+		srv.Start() // serves /ingest + /metrics on the port
 		portServers = append(portServers, srv)
 		log.Printf("[PORT SERVER] Initialized /metrics and /ingest on port %d", p)
 	}
 	ports := len(portServers)
 	portMutex.Unlock()
-
-	// _ = UpdatePrometheusYML(".../prometheus.yml")??
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":            "ok",
@@ -174,7 +276,7 @@ func (psv *PortServer) Start() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(psv.Registry, promhttp.HandlerOpts{}))
 
-	// NEW: tambah handler POST /ingest pada mux port
+	// Register the per-port /ingest handler that forwards payloads locally.
 	mux.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -185,6 +287,8 @@ func (psv *PortServer) Start() {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		log.Printf("[DEBUG] /ingest from %s on port=%d metrics=%d",
+			r.RemoteAddr, psv.Port, len(payload.Metrics))
 		if n, err := processIngest(payload); err != nil {
 			http.Error(w, "ingest failed", http.StatusInternalServerError)
 		} else {
@@ -226,12 +330,7 @@ func getOrCreatePortIndex(machineID string) int {
 	return portIndex
 }
 
-// var (
-// 	rawMetricsMap = make(map[string]*prometheus.GaugeVec)
-// 	rawMetricsMux sync.Mutex
-// )
-
-// getOrCreateRaw memastikan metric RAW terdaftar di registry port
+// getOrCreateRaw ensures RAW metrics are registered in the port registry
 func (psv *PortServer) getOrCreateRaw(name string, labelKeys []string) *prometheus.GaugeVec {
 	psv.RawMux.Lock()
 	defer psv.RawMux.Unlock()
@@ -241,7 +340,7 @@ func (psv *PortServer) getOrCreateRaw(name string, labelKeys []string) *promethe
 	}
 	g := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: name, // mis. "fake_machine_metric" dari exporter
+			Name: name, // e.g. "fake_machine_metric" from exporter
 			Help: fmt.Sprintf("Raw metric %s ingested on partition port %d", name, psv.Port),
 		},
 		labelKeys,
@@ -337,18 +436,43 @@ func UpdatePrometheusYML(path string) error {
 	return os.WriteFile(path, []byte(strings.Join(newLines, "\n")), 0644)
 }
 
+func readBoolEnv(key string) (bool, bool) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return false, false
+	}
+	parsed, err := strconv.ParseBool(val)
+	if err != nil {
+		return false, false
+	}
+	return parsed, true
+}
+
+func readIntEnv(key string, def int) int {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return def
+	}
+	parsed, err := strconv.Atoi(val)
+	if err != nil || parsed <= 0 {
+		return def
+	}
+	return parsed
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	go logIngestionRate()
 
 	router := gin.Default()
-	// router.POST("/ingest", handleIngest)
+	router.POST("/ingest", handleIngest)
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	// router.GET("/throughput_test", runStressThroughputTest)
 	router.GET("/parse", handleParse)
 	router.POST("/ingest-query-result", handleQueryResultIngest)
 	router.GET("/debug-state", handleDebugState)
 	router.POST("/register_config", handleRegisterConfig)
+	router.GET("/ingest_stats", handleIngestStats)
 
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "UP", "message": "PromSketch Go server is running."})
@@ -382,10 +506,11 @@ func handleDebugState(c *gin.Context) {
 		machineID := fmt.Sprintf("machine_%d", i)
 		lsetBuilder := labels.NewBuilder(labels.Labels{})
 		lsetBuilder.Set("machineid", machineID)
-		lsetBuilder.Set(labels.MetricName, "fake_machine_metric") // Ganti sesuai metric kamu
+		// Adjust the metric name and function below to inspect a different sketch.
+		lsetBuilder.Set(labels.MetricName, "fake_machine_metric")
 		lset := lsetBuilder.Labels()
 
-		minTime, maxTime := ps.PrintCoverage(lset, "avg_over_time") // Ganti ke fungsi yang kamu uji
+		minTime, maxTime := ps.PrintCoverage(lset, "avg_over_time")
 
 		if minTime != -1 {
 			foundCount++
@@ -410,14 +535,9 @@ func handleDebugState(c *gin.Context) {
 	}
 }
 
-// Tambahkan fungsi helper debug di bawah deklarasi import:
-// func debugSampleIngested(metric string, value float64, labels map[string]string, ts int64) {
-// 	log.Printf("[DEBUG-INGEST] metric=%s value=%f labels=%v timestamp=%d", metric, value, labels, ts)
-// }
-
 func debugAggregationResult(fname string, lset map[string]string, mint, maxt int64, result float64, count float64) {
 	// log.Printf("[DEBUG-AGG] function=%s labels=%v mint=%d maxt=%d result=%f count=%f", fname, lset, mint, maxt, result, count)
-	// Simpan ke file CSV juga (opsional)
+	// Also write to CSV (optional)
 	f, err := os.OpenFile("debug_agg_log.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
 		w := csv.NewWriter(f)
@@ -467,7 +587,7 @@ func debugWindowCounts(
 
 	f, err := os.OpenFile("debug_window_counts.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
-		// tulis header jika file masih kosong
+		// Write the header if the file is still empty
 		if info, _ := f.Stat(); info.Size() == 0 {
 			_, _ = f.WriteString("timestamp,function,metric,machineid,prom_mint,prom_maxt,prom_count,psk_mint,psk_maxt,psk_count\n")
 		}
@@ -491,162 +611,36 @@ func debugWindowCounts(
 
 var totalIngested int64
 
-// func handleIngest(c *gin.Context) {
-// 	var payload IngestPayload
-// 	if err := c.ShouldBindJSON(&payload); err != nil {
-// 		log.Printf("Error binding JSON payload: %v", err)
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
-// 		return
-// 	}
-
-// 	start := time.Now()
-// 	var wg sync.WaitGroup
-
-// 	for _, metric := range payload.Metrics {
-// 		wg.Add(1)
-// 		go func(metric MetricPayload) {
-// 			defer wg.Done()
-
-// 			log.Printf("[INGEST] name=%s labels=%v value=%.2f", metric.Name, metric.Labels, metric.Value)
-
-// 			lsetBuilder := labels.NewBuilder(labels.Labels{})
-// 			// Tambahkan label dari payload (cth: machineid="machine_0")
-// 			for k, v := range metric.Labels {
-// 				lsetBuilder.Set(k, v)
-// 			}
-// 			lsetBuilder.Set(labels.MetricName, metric.Name) // labels.MetricName = "__name__"
-// 			lset := lsetBuilder.Labels()
-
-// 			log.Printf("[INGEST] Inserting to sketch: name=%s labels=%v ts=%d value=%.2f", metric.Name, metric.Labels, payload.Timestamp, metric.Value)
-
-// 			if err := ps.SketchInsert(lset, payload.Timestamp, metric.Value); err != nil {
-// 				log.Printf("[INGEST ERROR] Failed to insert sketch: %v", err)
-// 			}
-// 			atomic.AddInt64(&totalIngested, 1)
-
-// 		}(metric)
-// 	}
-
-// 	wg.Wait()
-// 	totalDuration := time.Since(start).Milliseconds()
-// 	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
-
-// 	go forwardToCloud(payload)
-
-// 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
-// }
-
-// func handleIngest(c *gin.Context) {
-// 	var payload IngestPayload
-// 	if err := c.ShouldBindJSON(&payload); err != nil {
-// 		log.Printf("Error binding JSON payload: %v", err)
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
-// 		return
-// 	}
-
-// 	start := time.Now()
-// 	var wg sync.WaitGroup
-// 	sem := make(chan struct{}, maxIngestGoroutines)
-
-// 	for _, metric := range payload.Metrics {
-// 		wg.Add(1)
-// 		sem <- struct{}{}
-
-// 		go func(metric MetricPayload) {
-// 			defer wg.Done()
-// 			defer func() { <-sem }()
-
-// 			// ========== ORIGINAL (Spesific machine id) ==========
-// 			lsetBuilder := labels.NewBuilder(labels.Labels{})
-// 			for k, v := range metric.Labels {
-// 				lsetBuilder.Set(k, v)
-// 			}
-// 			lsetBuilder.Set(labels.MetricName, metric.Name)
-// 			lsetOriginal := lsetBuilder.Labels()
-
-// 			if err := ps.SketchInsert(lsetOriginal, payload.Timestamp, metric.Value); err == nil {
-// 				atomic.AddInt64(&totalIngested, 1)
-// 				ingestedMetrics.WithLabelValues(metric.Name, metric.Labels["machineid"]).Set(metric.Value)
-
-// 				// Add to registry per-port
-// 				machineID := metric.Labels["machineid"]
-// 				if machineID != "" {
-// 					portIndex := getOrCreatePortIndex(machineID)
-// 					if portIndex < len(portServers) {
-// 						portServers[portIndex].Metrics.WithLabelValues(metric.Name, machineID).Set(metric.Value)
-// 					}
-// 				}
-// 			}
-// 			// ====== RAW DATA EXPORTER ======
-// 			labelKeys := []string{}
-// 			labelVals := []string{}
-// 			for k, v := range metric.Labels {
-// 				labelKeys = append(labelKeys, k)
-// 				labelVals = append(labelVals, v)
-// 			}
-// 			rawGauge := getOrCreateRawMetric(metric.Name, labelKeys)
-// 			rawGauge.WithLabelValues(labelVals...).Set(metric.Value)
-
-// 			// ========== GLOBAL (without machineid) ==========
-// 			lsetGlobalBuilder := labels.NewBuilder(labels.Labels{})
-// 			for k, v := range metric.Labels {
-// 				if k != "machineid" {
-// 					lsetGlobalBuilder.Set(k, v)
-// 				}
-// 			}
-// 			lsetGlobalBuilder.Set(labels.MetricName, metric.Name)
-// 			lsetGlobal := lsetGlobalBuilder.Labels()
-
-// 			if err := ps.SketchInsert(lsetGlobal, payload.Timestamp, metric.Value); err == nil {
-// 				atomic.AddInt64(&totalIngested, 1)
-// 				ingestedMetrics.WithLabelValues(metric.Name, "global").Set(metric.Value)
-// 			}
-// 		}(metric)
-// 	}
-
-// 	wg.Wait()
-
-// 	// Automaticly update prometheus.yml
-// 	now := time.Now()
-// 	if now.Sub(lastYMLUpdate) > 10*time.Second {
-// 		ymlPath := "./prometheus/documentation/examples/prometheus.yml"
-// 		if err := UpdatePrometheusYML(ymlPath); err != nil {
-// 			log.Printf("Failed to update Prometheus config: %v", err)
-// 		} else {
-// 			log.Printf("Updated Prometheus config at %s", ymlPath)
-// 			lastYMLUpdate = now
-// 		}
-// 	}
-
-// 	totalDuration := time.Since(start).Milliseconds()
-// 	log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
-
-// 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
-// }
-
+// handleIngest accepts JSON payloads from exporters and triggers local/remote ingestion.
 func handleIngest(c *gin.Context) {
 	var payload IngestPayload
 	if err := c.ShouldBindJSON(&payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid JSON payload: %v", err.Error())})
 		return
 	}
+
+	log.Printf("[DEBUG] ingest request: %d metrics", len(payload.Metrics))
+	for _, m := range payload.Metrics {
+		log.Printf("[DEBUG] metric=%s labels=%v value=%v", m.Name, m.Labels, m.Value)
+	}
+
 	_, _ = processIngest(payload)
-	// Automaticly update prometheus.yml
+	// Automatically refresh prometheus.yml if enough time has passed
 	now := time.Now()
-	if now.Sub(lastYMLUpdate) > 10*time.Second {
-		ymlPath := "./prometheus/documentation/examples/prometheus.yml"
-		if err := UpdatePrometheusYML(ymlPath); err != nil {
+	if now.Sub(lastPromConfigUpdate) > promConfigUpdateInterval {
+		if err := UpdatePrometheusYML(prometheusConfigPath); err != nil {
 			log.Printf("Failed to update Prometheus config: %v", err)
 		} else {
-			log.Printf("Updated Prometheus config at %s", ymlPath)
-			lastYMLUpdate = now
+			log.Printf("Updated Prometheus config at %s", prometheusConfigPath)
+			lastPromConfigUpdate = now
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "success", "ingested_metrics_count": len(payload.Metrics)})
 }
 
+// processIngest fans out ingestion work while respecting max goroutine limits.
 func processIngest(payload IngestPayload) (int, error) {
-	// start := time.Now()
+	log.Printf("[DEBUG] processIngest: %d metrics in this request", len(payload.Metrics))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxIngestGoroutines)
 
@@ -656,70 +650,86 @@ func processIngest(payload IngestPayload) (int, error) {
 		go func(metric MetricPayload) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// debugSampleIngested(metric.Name, metric.Value, metric.Labels, payload.Timestamp)
-			// ========== ORIGINAL (Spesific machine id) ==========
-			// lset original (per machineid)
-			lsetBuilder := labels.NewBuilder(labels.Labels{})
-			for k, v := range metric.Labels {
-				lsetBuilder.Set(k, v)
-			}
-			lsetBuilder.Set(labels.MetricName, metric.Name)
-			lsetOriginal := lsetBuilder.Labels()
-			// INSERT to sketch global ‘ps’
-			if err := ps.SketchInsert(lsetOriginal, payload.Timestamp, metric.Value); err == nil {
-				atomic.AddInt64(&totalIngested, 1)
-				ingestedMetrics.WithLabelValues(metric.Name, metric.Labels["machineid"]).Set(metric.Value)
-
-				// Add to registry per-port
-				machineID := metric.Labels["machineid"]
-				if machineID != "" {
-					portIndex := getOrCreatePortIndex(machineID)
-					if portIndex < len(portServers) {
-						portServers[portIndex].Metrics.WithLabelValues(metric.Name, machineID).Set(metric.Value)
-					}
-				}
-			}
-			// ====== RAW DATA EXPORTER — per-port ======
-			labelKeys := make([]string, 0, len(metric.Labels))
-			for k := range metric.Labels {
-				labelKeys = append(labelKeys, k)
-			}
-			sort.Strings(labelKeys)
-			labelVals := make([]string, 0, len(labelKeys))
-			for _, k := range labelKeys {
-				labelVals = append(labelVals, metric.Labels[k])
-			}
-
-			// Tentukan port dari machineid, lalu update RAW di registry port tsb
-			portIndex := getOrCreatePortIndex(metric.Labels["machineid"])
-			if portIndex < len(portServers) {
-				raw := portServers[portIndex].getOrCreateRaw(metric.Name, labelKeys)
-				raw.WithLabelValues(labelVals...).Set(metric.Value)
-			}
-
-			// ========== GLOBAL (without machineid) ==========
-			lsetGlobalBuilder := labels.NewBuilder(labels.Labels{})
-			for k, v := range metric.Labels {
-				if k != "machineid" {
-					lsetGlobalBuilder.Set(k, v)
-				}
-			}
-			lsetGlobalBuilder.Set(labels.MetricName, metric.Name)
-			lsetGlobal := lsetGlobalBuilder.Labels()
-
-			if err := ps.SketchInsert(lsetGlobal, payload.Timestamp, metric.Value); err == nil {
-				atomic.AddInt64(&totalIngested, 1)
-				ingestedMetrics.WithLabelValues(metric.Name, "global").Set(metric.Value)
-			}
+			ingestMetricSample(metric, payload.Timestamp)
 		}(metric)
 	}
 	wg.Wait()
-	// totalDuration := time.Since(start).Milliseconds()
-	// log.Printf("[BATCH COMPLETED] Processed %d metrics in %dms", len(payload.Metrics), totalDuration)
+	if cfg.remoteWriter != nil {
+		cfg.remoteWriter.Forward(payload)
+	}
 	return len(payload.Metrics), nil
 }
 
-// Rechieved query results from promtools.py
+// ingestMetricSample inserts a single metric into sketches and records telemetry.
+func ingestMetricSample(metric MetricPayload, timestamp int64) {
+	if !cfg.disableInsert {
+		if err := ps.SketchInsert(buildLabelSet(metric), timestamp, metric.Value); err != nil {
+			return
+		}
+	}
+	recordIngestionTelemetry(metric)
+}
+
+// buildLabelSet converts metric labels into a Prometheus labels.Labels set.
+func buildLabelSet(metric MetricPayload) labels.Labels {
+	builder := labels.NewBuilder(labels.Labels{})
+	for key, val := range metric.Labels {
+		builder.Set(key, val)
+	}
+	builder.Set(labels.MetricName, metric.Name)
+	return builder.Labels()
+}
+
+// recordIngestionTelemetry updates global counters and per-port gauges.
+func recordIngestionTelemetry(metric MetricPayload) {
+	newTotal := atomic.AddInt64(&totalIngested, 1)
+
+	// DEBUG: this will fire for EVERY ingested sample
+	log.Printf("[DEBUG] sample ingested metric=%s machineid=%s total=%d value=%v",
+		metric.Name,
+		metric.Labels[machineIDLabel],
+		newTotal,
+		metric.Value,
+	)
+
+	machineID := metric.Labels["machineid"]
+	ingestedMetrics.WithLabelValues(metric.Name, machineID).Inc()
+	updatePerPortMetrics(metric, machineID)
+}
+
+// updatePerPortMetrics surfaces the latest value for a machine on its assigned ingest port.
+func updatePerPortMetrics(metric MetricPayload, machineID string) {
+	if machineID == "" {
+		return
+	}
+	portIndex := getOrCreatePortIndex(machineID)
+	if portIndex >= len(portServers) {
+		return
+	}
+
+	portServers[portIndex].Metrics.WithLabelValues(metric.Name, machineID).Set(metric.Value)
+	labelKeys, labelVals := sortedLabelPairs(metric.Labels)
+
+	rawGauge := portServers[portIndex].getOrCreateRaw(metric.Name, labelKeys)
+	rawGauge.WithLabelValues(labelVals...).Set(metric.Value)
+}
+
+// sortedLabelPairs returns deterministic key/value slices for use with GaugeVec.
+func sortedLabelPairs(labelMap map[string]string) ([]string, []string) {
+	keys := make([]string, 0, len(labelMap))
+	for key := range labelMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	values := make([]string, len(keys))
+	for i, key := range keys {
+		values[i] = labelMap[key]
+	}
+	return keys, values
+}
+
+// handleQueryResultIngest receives query results forwarded by promtools.py.
 func handleQueryResultIngest(c *gin.Context) {
 	var result struct {
 		Function       string  `json:"function"`
@@ -739,126 +749,15 @@ func handleQueryResultIngest(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
-// func pushSyntheticResult(metricName string, labels map[string]string, value float64, timestamp int64) {
-// 	pushgatewayURL := os.Getenv("PUSHGATEWAY_URL")
-// 	if pushgatewayURL == "" {
-// 		pushgatewayURL = "http://localhost:9091"
-// 	}
-
-// 	labelParts := []string{}
-// 	for k, v := range labels {
-// 		if k == "__name__" {
-// 			continue // jangan push label __name__
-// 		}
-// 		labelParts = append(labelParts, fmt.Sprintf("%s=\"%s\"", k, v))
-// 	}
-
-// 	labelStr := strings.Join(labelParts, ",")
-
-// 	body := fmt.Sprintf("%s{%s} %f\n", metricName, labelStr, value)
-
-// 	instanceID := labels["machineid"]
-// 	if instanceID == "" {
-// 		instanceID = "default"
-// 	}
-
-// 	url := fmt.Sprintf("%s/metrics/job/promsketch_push/instance/%s", pushgatewayURL, instanceID)
-
-// 	log.Printf("[PUSH DEBUG] Pushing to %s with body:\n%s", url, body)
-
-// 	req, err := http.NewRequest("PUT", url, strings.NewReader(body))
-// 	if err != nil {
-// 		log.Printf("[PUSH ERROR] request: %v", err)
-// 		return
-// 	}
-// 	req.Header.Set("Content-Type", "text/plain")
-
-// 	client := &http.Client{Timeout: 3 * time.Second}
-// 	resp, err := client.Do(req)
-// 	if err != nil {
-// 		log.Printf("[PUSH ERROR] send: %v", err)
-// 		return
-// 	}
-// 	defer resp.Body.Close()
-
-// 	if resp.StatusCode >= 300 {
-// 		log.Printf("[PUSH ERROR] status: %s", resp.Status)
-// 	} else {
-// 		log.Printf("[PUSH OK] metric=%s labels=%v value=%.2f", metricName, labels, value)
-// 	}
-// }
-
-// func forwardToCloud(payload IngestPayload) {
-// 	if cloudEndpoint == "" {
-// 		log.Printf("[FORWARD] Skipped: FORWARD_ENDPOINT not set")
-// 		return
-// 	}
-// 	data, err := json.Marshal(payload)
-// 	if err != nil {
-// 		log.Printf("[FORWARD ERROR] marshal: %v", err)
-// 		return
-// 	}
-// 	req, err := http.NewRequest("POST", cloudEndpoint, bytes.NewBuffer(data))
-// 	if err != nil {
-// 		log.Printf("[FORWARD ERROR] request: %v", err)
-// 		return
-// 	}
-// 	req.Header.Set("Content-Type", "application/json")
-
-// 	client := &http.Client{Timeout: 5 * time.Second}
-// 	resp, err := client.Do(req)
-// 	if err != nil {
-// 		log.Printf("[FORWARD ERROR] send: %v", err)
-// 		return
-// 	}
-// 	defer resp.Body.Close()
-
-// 	if resp.StatusCode >= 300 {
-// 		log.Printf("[FORWARD ERROR] status: %s", resp.Status)
-// 	} else {
-// 		log.Printf("[FORWARD] success: %d bytes sent", len(data))
-// 	}
-// }
-
-// func forwardToCloud(payload IngestPayload) {
-// 	for _, metric := range payload.Metrics {
-// 		url := fmt.Sprintf("http://pushgateway:9091/metrics/job/promsketch/instance/%s", metric.Labels["machineid"])
-// 		body := fmt.Sprintf("fake_metric{machineid=\"%s\"} %f\n", metric.Labels["machineid"], metric.Value)
-// 		resp, err := http.Post(url, "text/plain", strings.NewReader(body))
-// 		if err != nil {
-// 			log.Printf("[PUSHGATEWAY ERROR] %v", err)
-// 			continue
-// 		}
-// 		resp.Body.Close()
-// 	}
-// }
-
-// func forwardToCloud(payload IngestPayload) {
-// 	for _, metric := range payload.Metrics {
-// 		machineID := metric.Labels["machineid"]
-// 		url := fmt.Sprintf("http://pushgateway:9091/metrics/job/promsketch/instance/%s", machineID)
-
-// 		pr, pw := io.Pipe()
-
-// 		go func(mid string, val float64) {
-// 			// Write directly to pipe writer
-// 			fmt.Fprintf(pw, "fake_metric{machineid=\"%s\"} %f\n", mid, val)
-// 			pw.Close()
-// 		}(machineID, metric.Value)
-
-// 		resp, err := http.Post(url, "text/plain", pr)
-// 		if err != nil {
-// 			log.Printf("[PUSHGATEWAY ERROR] %v", err)
-// 			continue
-// 		}
-// 		resp.Body.Close()
-// 	}
-// }
-
 func logIngestionRate() {
 	var lastTotal int64 = 0
+	lastTime := time.Now()
+	if throughputAvgWindow < 1 {
+		throughputAvgWindow = 1
+	}
+	rateWindow := make([]float64, 0, throughputAvgWindow)
 
-	// file log CSV
+	// Prepare the CSV log file for throughput metrics.
 	file, err := os.OpenFile("throughput_log.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open throughput log file: %v", err)
@@ -870,14 +769,43 @@ func logIngestionRate() {
 		file.WriteString("timestamp,samples_per_sec,total_samples\n")
 	}
 
-	for {
-		time.Sleep(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
+	for range ticker.C {
 		current := atomic.LoadInt64(&totalIngested)
-		rate := float64(current-lastTotal) / 5.0
-		timestamp := time.Now().Format(time.RFC3339)
+		now := time.Now()
+		elapsed := now.Sub(lastTime).Seconds()
+		if elapsed <= 0 {
+			continue
+		}
+		samples := current - lastTotal
+		rate := float64(samples) / elapsed
+		rateWindow = append(rateWindow, rate)
+		if len(rateWindow) > throughputAvgWindow {
+			rateWindow = rateWindow[1:]
+		}
+		var avgRate float64
+		for _, r := range rateWindow {
+			avgRate += r
+		}
+		if len(rateWindow) > 0 {
+			avgRate /= float64(len(rateWindow))
+		}
+		timestamp := now.Format(time.RFC3339)
 
-		log.Printf("[SERVER SPEED] Received %.2f samples/sec (Total: %d)", rate, current)
+		log.Printf(
+			"[INGEST STATS] interval=%.2fs samples=%d inst_rate=%.2f/sec avg_rate=%.2f/sec total=%d",
+			elapsed, samples, rate, avgRate, current,
+		)
+		lastIngestionStats.Store(ingestionSnapshot{
+			Rate:        rate,
+			AvgRate:     avgRate,
+			Total:       current,
+			Samples:     samples,
+			IntervalSec: elapsed,
+			Timestamp:   now,
+		})
 
 		// Save to CSV file
 		entry := fmt.Sprintf("%s,%.2f,%d\n", timestamp, rate, current)
@@ -886,29 +814,34 @@ func logIngestionRate() {
 		}
 
 		lastTotal = current
+		lastTime = now
 	}
 }
 
-// func handleParse(c *gin.Context) {
-// 	query := c.Query("q")
-// 	if query == "" {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing query parameter 'q'"})
-// 		return
-// 	}
+// handleIngestStats exposes rolling ingest metrics for dashboards or CLI tools.
+func handleIngestStats(c *gin.Context) {
+	raw := lastIngestionStats.Load()
+	stats, _ := raw.(ingestionSnapshot)
+	total := atomic.LoadInt64(&totalIngested)
+	stats.Total = total
+	c.JSON(http.StatusOK, gin.H{
+		"total_ingested":      stats.Total,
+		"rate_per_sec":        stats.Rate,
+		"avg_rate_per_sec":    stats.AvgRate,
+		"samples_in_interval": stats.Samples,
+		"interval_seconds":    stats.IntervalSec,
+		"timestamp_ms":        stats.Timestamp.UnixMilli(),
+		"timestamp_rfc3339":   stats.Timestamp.Format(time.RFC3339),
+	})
+}
 
-// 	expr, err := parser.ParseExpr(query)
-// 	if err != nil {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Parse error: %v", err)})
-// 		return
-// 	}
-
-// 	c.JSON(http.StatusOK, gin.H{
-// 		"status": "success",
-// 		"ast":    expr.String(),
-// 	})
-// }
-
+// handleParse validates PromQL-style range queries and executes them via sketches.
 func handleParse(c *gin.Context) {
+	if cfg.disableQuery {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "query endpoint disabled"})
+		return
+	}
+
 	query := c.Query("q")
 	if query == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing query parameter 'q'"})
@@ -977,6 +910,9 @@ func handleParse(c *gin.Context) {
 		}
 	}
 
+	machineID, hasMachineID := labelMap[machineIDLabel]
+	aggregateAllMachines := !hasMachineID || machineID == ""
+
 	lsetBuilder := labels.NewBuilder(labels.Labels{})
 	for k, v := range labelMap {
 		lsetBuilder.Set(k, v)
@@ -986,19 +922,28 @@ func handleParse(c *gin.Context) {
 
 	log.Printf("[QUERY ENGINE] Parsed components: func=%s, lset=%v, otherArgs=%.2f", funcName, lset, otherArgs)
 
-	// Calculate the time range based on the range
+	// Calculate the requested Prometheus window: [now-range, now].
 	queryDuration := rangeArg.Range
 	maxt := time.Now().UnixMilli()
 	mint := maxt - queryDuration.Milliseconds()
 
-	// GEt sketch value
-	sketchMin, sketchMax := ps.PrintCoverage(lset, funcName)
+	var sketchMin, sketchMax int64
+	if aggregateAllMachines {
+		sketchMin, sketchMax = ps.PrintAggregateCoverage(lset, funcName, machineIDLabel)
+	} else {
+		sketchMin, sketchMax = ps.PrintCoverage(lset, funcName)
+	}
 	log.Printf("[SKETCH COVERAGE] Sketch coverage: min=%d max=%d | requested mint=%d maxt=%d", sketchMin, sketchMax, mint, maxt)
 
-	// If there's no data in sketch
+	// If there's no data in sketch cache, provision it and ask client to retry.
 	if sketchMin == -1 || sketchMax == -1 {
-		log.Printf("[QUERY ENGINE] No sketch coverage available yet for %v. Creating instance.", lset)
-		ps.NewSketchCacheInstance(lset, funcName, queryDuration.Milliseconds(), 100000, 10000.0)
+		if aggregateAllMachines {
+			log.Printf("[QUERY ENGINE] No aggregate coverage yet for %v. Ensuring per-machine sketches.", lset)
+			ps.EnsureAggregateSketches(lset, funcName, queryDuration.Milliseconds(), 100000, 10000.0, machineIDLabel)
+		} else {
+			log.Printf("[QUERY ENGINE] No sketch coverage available yet for %v. Creating instance.", lset)
+			ps.NewSketchCacheInstance(lset, funcName, queryDuration.Milliseconds(), 100000, 10000.0)
+		}
 
 		c.JSON(http.StatusAccepted, gin.H{
 			"status":  "pending",
@@ -1007,58 +952,39 @@ func handleParse(c *gin.Context) {
 		return
 	}
 
-	// 	// COrrection if requested query outside the range
-	// if mint < sketchMin {
-	// 	mint = sketchMin
-	// }
-	// if maxt > sketchMax {
-	// 	maxt = sketchMax
-	// }
-
-	// Sliding-window clamp: jaga lebar ~W dan hindari efek "kumulatif" saat warm-up
-	W := queryDuration.Milliseconds()
-
-	// t2 = waktu terbaru yang benar-benar ada di sketch
-	t2 := maxt
-	if t2 > sketchMax {
-		t2 = sketchMax
-	}
-
-	// geser t1 agar lebar window W
-	t1 := t2 - W
-	if t1 < sketchMin {
-		// histori belum penuh: kunci t1 di sketchMin, lalu upayakan lebar ~W
-		t1 = sketchMin
-		if t1+W <= sketchMax {
-			t2 = t1 + W
-		} else {
-			// coverage < W: pakai coverage yang ada (tidak membesar tiap detik)
-			t2 = sketchMax
-		}
-	}
-
-	mint, maxt = t1, t2
-	// DEBUG: Log window penyesuaian PromSketch vs Prometheus
-	log.Printf("[DEBUG WINDOW] Prometheus requested window: mint=%d maxt=%d (durasi=%d ms)", maxt-queryDuration.Milliseconds(), maxt, queryDuration.Milliseconds())
-	log.Printf("[DEBUG WINDOW] PromSketch final window:     mint=%d maxt=%d (durasi=%d ms)", mint, maxt, maxt-mint)
-	// ----- SAMPLE COUNT untuk 2 window -----
-	// Prometheus requested window: panjang W berakhir di 'maxt' (yang sudah diselaraskan)
-	promMint := maxt - W
+	// Store the Prometheus window before evaluating the sketch
 	promMaxt := maxt
+	promMint := promMaxt - queryDuration.Milliseconds()
+
+	// Align sketch evaluation range with the Prometheus request.
+	mint = promMint
+	maxt = promMaxt
+	// DEBUG: Log PromSketch vs. Prometheus window adjustments
+	log.Printf("[DEBUG WINDOW] Prometheus requested window: mint=%d maxt=%d (duration=%d ms)", promMint, promMaxt, queryDuration.Milliseconds())
+	log.Printf("[DEBUG WINDOW] PromSketch final window:     mint=%d maxt=%d (duration=%d ms)", mint, maxt, maxt-mint)
+	// Track sample counts for both the Prometheus and PromSketch windows.
 
 	var promCount float64 = math.NaN()
-	if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, promMint, promMaxt, promMaxt); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+	if aggregateAllMachines {
+		if cntVec, _ := ps.EvalAggregate("count_over_time", lset, 0.0, promMint, promMaxt, promMaxt, machineIDLabel); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+			promCount = cntVec[0].F
+		}
+	} else if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, promMint, promMaxt, promMaxt); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
 		promCount = cntVec[0].F
 	}
 
 	var pskCount float64 = math.NaN()
-	if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, mint, maxt, maxt); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+	if aggregateAllMachines {
+		if cntVec, _ := ps.EvalAggregate("count_over_time", lset, 0.0, mint, maxt, maxt, machineIDLabel); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+			pskCount = cntVec[0].F
+		}
+	} else if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, mint, maxt, maxt); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
 		pskCount = cntVec[0].F
 	}
 
-	// Log ke console & CSV
+	// Log to console and CSV for later inspection.
 	debugWindowCounts(funcName, lset, promMint, promMaxt, mint, maxt, promCount, pskCount)
-	// Validasi akhir
+	// Sanity-check the adjusted window boundaries.
 	if maxt <= mint {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"status":  "failed",
@@ -1072,18 +998,28 @@ func handleParse(c *gin.Context) {
 	log.Printf("[QUERY ENGINE] Final adjusted range: mint=%d maxt=%d", mint, maxt)
 
 	startEval := time.Now()
-	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
+	var vector promsketch.Vector
+	var annotations annotations.Annotations
+	if aggregateAllMachines {
+		vector, annotations = ps.EvalAggregate(funcName, lset, otherArgs, mint, maxt, curTime, machineIDLabel)
+	} else {
+		vector, annotations = ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
+	}
 
-	// Print every exec steps
+	// Log each evaluation step for debugging.
 	evalLatency := time.Since(startEval)
 
 	// Logging server-side latency
 	log.Printf("[QUERY ENGINE] ps.Eval latency: %s (%.2f ms)", evalLatency, float64(evalLatency.Microseconds())/1000.0)
 
 	results := []map[string]interface{}{}
+	resultMachineLabel := machineID
+	if aggregateAllMachines {
+		resultMachineLabel = "global"
+	}
 	for _, sample := range vector {
 		if !math.IsNaN(sample.F) {
-			// Perbaiki timestamp jika belum diset (nol)
+			// Fix the timestamp if it was never set (zero)
 			timestamp := sample.T
 			if timestamp == 0 {
 				timestamp = curTime
@@ -1097,7 +1033,7 @@ func handleParse(c *gin.Context) {
 			queryResults.WithLabelValues(
 				funcName,
 				lset.Get("__name__"),
-				lset.Get("machineid"),
+				resultMachineLabel,
 				fmt.Sprintf("%.2f", otherArgs),
 			).Set(sample.F)
 		}
@@ -1107,15 +1043,19 @@ func handleParse(c *gin.Context) {
 
 	var execCount float64 = math.NaN()
 	if needsExecCount {
-		// Jalankan second pass: count_over_time(...) pada window final PromSketch
-		if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, mint, maxt, curTime); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+		// Run a second pass: count_over_time(...) on the final PromSketch window
+		if aggregateAllMachines {
+			if cntVec, _ := ps.EvalAggregate("count_over_time", lset, 0.0, mint, maxt, curTime, machineIDLabel); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
+				execCount = cntVec[0].F
+			}
+		} else if cntVec, _ := ps.Eval("count_over_time", lset, 0.0, mint, maxt, curTime); len(cntVec) > 0 && !math.IsNaN(cntVec[0].F) {
 			execCount = cntVec[0].F
 		}
-		// Log + CSV
+		// Persist execution sample stats for debugging.
 		debugExecSamples(funcName, lset, mint, maxt, curTime, execCount)
 	}
 
-	// --- build response ---
+	// Build the HTTP response payload.
 	log.Printf("[QUERY ENGINE] Evaluation successful. Returning %d data points.", len(results))
 	response := gin.H{
 		"status":           "success",
@@ -1123,7 +1063,7 @@ func handleParse(c *gin.Context) {
 		"query_latency_ms": float64(evalLatency.Microseconds()) / 1000.0,
 	}
 
-	// --- MERGE/ADD annotations agar klien bisa baca window & sample count ---
+	// Attach annotations so clients can read window and sample-count metadata.
 	respAnn := gin.H{}
 	for k, v := range annotations {
 		respAnn[k] = v
@@ -1139,196 +1079,5 @@ func handleParse(c *gin.Context) {
 	respAnn["prometheus_sample_count"] = promCount
 	respAnn["promsketch_sample_count"] = pskCount
 
-	// (kode existing untuk debugAggregationResult dll tetap)
 	c.JSON(http.StatusOK, response)
 }
-
-// func handleParse(c *gin.Context) {
-// 	query := c.Query("q")
-// 	if query == "" {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing query parameter 'q'"})
-// 		return
-// 	}
-// 	log.Printf("[QUERY ENGINE] Received query: %s", query)
-
-// 	expr, err := parser.ParseExpr(query)
-// 	if err != nil {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Parse error: %v", err)})
-// 		return
-// 	}
-
-// 	call, ok := expr.(*parser.Call)
-// 	if !ok {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Query must be a function call (e.g., avg_over_time(...))"})
-// 		return
-// 	}
-
-// 	funcName := call.Func.Name
-// 	otherArgs := 0.0
-
-// 	matrixSelectorArg := call.Args[len(call.Args)-1]
-// 	rangeArg, ok := matrixSelectorArg.(*parser.MatrixSelector)
-// 	if !ok {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "The last argument must be a range vector (e.g., metric[60000ms])"})
-// 		return
-// 	}
-
-// 	if len(call.Args) > 1 {
-// 		firstArg, ok := call.Args[0].(*parser.NumberLiteral)
-// 		if !ok {
-// 			c.JSON(http.StatusBadRequest, gin.H{"error": "Numeric argument (like quantile) must be a number"})
-// 			return
-// 		}
-// 		otherArgs = firstArg.Val
-// 	}
-
-// 	vs, ok := rangeArg.VectorSelector.(*parser.VectorSelector)
-// 	if !ok {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse vector selector inside the range vector"})
-// 		return
-// 	}
-// 	metricName := vs.Name
-// 	labelMap := make(map[string]string)
-// 	for _, matcher := range vs.LabelMatchers {
-// 		if matcher.Type == labels.MatchEqual {
-// 			labelMap[matcher.Name] = matcher.Value
-// 		} else {
-// 			c.JSON(http.StatusBadRequest, gin.H{"error": "Only '=' label matchers are supported"})
-// 			return
-// 		}
-// 	}
-
-// 	lsetBuilder := labels.NewBuilder(labels.Labels{})
-// 	for k, v := range labelMap {
-// 		lsetBuilder.Set(k, v)
-// 	}
-// 	lsetBuilder.Set(labels.MetricName, metricName)
-// 	lset := lsetBuilder.Labels()
-
-// 	log.Printf("[QUERY ENGINE] Parsed components: func=%s, lset=%v, otherArgs=%.2f", funcName, lset, otherArgs)
-
-// 	// Calculate the time range based on the range
-// 	queryDuration := rangeArg.Range
-// 	maxt := time.Now().UnixMilli()
-// 	mint := maxt - queryDuration.Milliseconds()
-
-// 	// GEt sketch value
-// 	sketchMin, sketchMax := ps.PrintCoverage(lset, funcName)
-// 	log.Printf("[SKETCH COVERAGE] Sketch coverage: min=%d max=%d | requested mint=%d maxt=%d", sketchMin, sketchMax, mint, maxt)
-
-// 	// If there's no data in sketch
-// 	if sketchMin == -1 || sketchMax == -1 {
-// 		log.Printf("[QUERY ENGINE] No sketch coverage available yet for %v. Creating instance.", lset)
-// 		ps.NewSketchCacheInstance(lset, funcName, queryDuration.Milliseconds(), 100000, 10000.0)
-
-// 		c.JSON(http.StatusAccepted, gin.H{
-// 			"status":  "pending",
-// 			"message": "Sketch data is being prepared. Please try again in a few moments.",
-// 		})
-// 		return
-// 	}
-
-// 	// COrrection if requested query outside the range
-// 	if mint < sketchMin {
-// 		mint = sketchMin
-// 	}
-// 	if maxt > sketchMax {
-// 		maxt = sketchMax
-// 	}
-
-// 	// Validasi akhir
-// 	if maxt <= mint {
-// 		c.JSON(http.StatusBadRequest, gin.H{
-// 			"status":  "failed",
-// 			"message": "Query time range is outside of sketch data coverage.",
-// 		})
-// 		return
-// 	}
-
-// 	curTime := maxt
-
-// 	log.Printf("[QUERY ENGINE] Final adjusted range: mint=%d maxt=%d", mint, maxt)
-
-// 	vector, annotations := ps.Eval(funcName, lset, otherArgs, mint, maxt, curTime)
-
-// 	results := []map[string]interface{}{}
-// 	for _, sample := range vector {
-// 		if !math.IsNaN(sample.F) {
-// 			results = append(results, map[string]interface{}{
-// 				"timestamp": sample.T,
-// 				"value":     sample.F,
-// 			})
-// 		}
-// 	}
-
-// 	log.Printf("[QUERY ENGINE] Evaluation successful. Returning %d data points.", len(results))
-// 	response := gin.H{
-// 		"status": "success",
-// 		"data":   results,
-// 	}
-// 	if len(annotations) > 0 {
-// 		response["annotations"] = annotations
-// 	}
-
-// 	c.JSON(http.StatusOK, response)
-// }
-
-// ===============================================================================================================================
-
-// ====================================================================================================================================
-
-// func runThroughputTest(c *gin.Context) {
-// 	seriesCountStr := c.DefaultQuery("series", "10000")
-// 	maxGoroutinesStr := c.DefaultQuery("max_goroutines", "50")
-
-// 	seriesCount, err1 := strconv.Atoi(seriesCountStr)
-// 	maxGoroutines, err2 := strconv.Atoi(maxGoroutinesStr)
-// 	if err1 != nil || err2 != nil || seriesCount <= 0 || maxGoroutines <= 0 {
-// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid query parameters"})
-// 		return
-// 	}
-
-// 	log.Printf("[THROUGHPUT TEST] Starting test with %d timeseries and max %d goroutines", seriesCount, maxGoroutines)
-
-// 	start := time.Now()
-// 	var wg sync.WaitGroup
-// 	var success int64
-// 	sem := make(chan struct{}, maxGoroutines)
-
-// 	for i := 0; i < seriesCount; i++ {
-// 		wg.Add(1)
-// 		sem <- struct{}{}
-
-// 		go func(i int) {
-// 			defer wg.Done()
-// 			defer func() { <-sem }()
-
-// 			machineID := fmt.Sprintf("benchstress_%d", i)
-// 			lset := labels.FromStrings(
-// 				"machineid", machineID,
-// 				"__name__", "benchmark_metric",
-// 			)
-
-// 			timestamp := time.Now().UnixMilli()
-// 			value := float64(i % 1000) // atau bisa diganti dengan rand.Float64() untuk nilai acak
-
-// 			if err := ps.SketchInsertInsertionThroughputTest(lset, timestamp, value); err == nil {
-// 				atomic.AddInt64(&success, 1)
-// 			} else {
-// 				log.Printf("[ERROR] Insert failed: %v", err)
-// 			}
-// 		}(i)
-// 	}
-
-// 	wg.Wait()
-// 	elapsed := time.Since(start).Seconds()
-// 	rate := float64(success) / elapsed
-
-// 	log.Printf("[THROUGHPUT TEST] Inserted %d samples in %.2fs (%.2f samples/sec)", success, elapsed, rate)
-
-// 	c.JSON(http.StatusOK, gin.H{
-// 		"inserted_samples": success,
-// 		"duration_seconds": elapsed,
-// 		"throughput":       fmt.Sprintf("%.2f samples/sec", rate),
-// 	})
-// }

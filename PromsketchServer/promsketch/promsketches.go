@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/zzylol/go-kll"
 	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/model/labels"
 	"github.com/zzylol/prometheus-sketch-VLDB/prometheus-sketches/util/annotations"
 )
@@ -409,36 +411,77 @@ func (ps *PromSketches) NewSketchCacheInstance(lset labels.Labels, funcName stri
 	return nil
 }
 
-// Mengembalikan min_time dan max_time dari sketch berdasarkan label dan fungsi.
+// Return min_time and max_time from the sketch based on labels and function.
 func (ps *PromSketches) PrintCoverage(lset labels.Labels, funcName string) (int64, int64) {
-	// Cari series berdasarkan hash label
 	series := ps.series.getByHash(lset.Hash(), lset)
 	if series == nil {
 		return -1, -1
 	}
-	// Cek jenis sketch
+	return coverageForSeries(series, funcName)
+}
+
+func (ps *PromSketches) PrintAggregateCoverage(base labels.Labels, funcName, groupLabel string) (int64, int64) {
+	matched := ps.collectSeriesByLabels(base, groupLabel)
+	if len(matched) == 0 {
+		return -1, -1
+	}
+	aggMin := int64(math.MaxInt64)
+	aggMax := int64(math.MinInt64)
+	for _, series := range matched {
+		minT, maxT := coverageForSeries(series, funcName)
+		if minT == -1 || maxT == -1 {
+			continue
+		}
+		if minT < aggMin {
+			aggMin = minT
+		}
+		if maxT > aggMax {
+			aggMax = maxT
+		}
+	}
+	if aggMax == int64(math.MinInt64) {
+		return -1, -1
+	}
+	return aggMin, aggMax
+}
+
+// EnsureAggregateSketches makes sure every matching series has sketch instances needed by funcName.
+func (ps *PromSketches) EnsureAggregateSketches(base labels.Labels, funcName string, timeWindowSize, itemWindowSize int64, valueScale float64, groupLabel string) int {
+	matched := ps.collectSeriesByLabels(base, groupLabel)
+	ensured := 0
+	for _, series := range matched {
+		if series == nil {
+			continue
+		}
+		if err := ps.NewSketchCacheInstance(series.lset, funcName, timeWindowSize, itemWindowSize, valueScale); err == nil {
+			ensured++
+		}
+	}
+	return ensured
+}
+
+func coverageForSeries(series *memSeries, funcName string) (int64, int64) {
+	if series == nil || series.sketchInstances == nil {
+		return -1, -1
+	}
 	stypes := funcSketchMap[funcName]
 	for _, stype := range stypes {
 		switch stype {
 		case EHUniv:
 			if series.sketchInstances.ehuniv == nil {
 				return -1, -1
-				// Jika sketch aktif, panggil .GetMinTime() dan .GetMaxTime().
-			} else {
-				return series.sketchInstances.ehuniv.GetMinTime(), series.sketchInstances.ehuniv.GetMaxTime()
 			}
+			return series.sketchInstances.ehuniv.GetMinTime(), series.sketchInstances.ehuniv.GetMaxTime()
 		case EHKLL:
 			if series.sketchInstances.ehkll == nil {
 				return -1, -1
-			} else {
-				return series.sketchInstances.ehkll.GetMinTime(), series.sketchInstances.ehkll.GetMaxTime()
 			}
+			return series.sketchInstances.ehkll.GetMinTime(), series.sketchInstances.ehkll.GetMaxTime()
 		case USampling:
 			if series.sketchInstances.sampling == nil {
 				return -1, -1
-			} else {
-				return series.sketchInstances.sampling.GetMinTime(), series.sketchInstances.sampling.GetMaxTime()
 			}
+			return series.sketchInstances.sampling.GetMinTime(), series.sketchInstances.sampling.GetMaxTime()
 		default:
 			return -1, -1
 		}
@@ -446,15 +489,15 @@ func (ps *PromSketches) PrintCoverage(lset labels.Labels, funcName string) (int6
 	return -1, -1
 }
 
-// Cek apakah sketch sudah mencakup rentang waktu
+// Check whether the sketch already covers the requested time range
 func (ps *PromSketches) LookUp(lset labels.Labels, funcName string, mint, maxt int64) bool {
-	// Cari memSeries dari label.
+	// Find the memSeries by labels.
 	series := ps.series.getByHash(lset.Hash(), lset)
 	if series == nil {
 		// fmt.Println("[lookup] no timeseries")
 		return false
 	}
-	// Ambil jenis sketch dari
+	// Determine the sketch types for this function
 	stypes := funcSketchMap[funcName]
 	for _, stype := range stypes {
 		switch stype {
@@ -533,7 +576,7 @@ func (ps *PromSketches) PrintEHUniv(lset labels.Labels) {
 	fmt.Println(series.sketchInstances.ehuniv.GetMemoryKB(), "KB", series.sketchInstances.ehuniv.map_count, series.sketchInstances.ehuniv.s_count)
 }
 
-// Cek coverage waktu seperti LookUp(), tapi otomatis perbesar time_window_size jika belum mencakup [mint, maxt].
+// Check coverage like LookUp(), but automatically enlarge time_window_size if [mint, maxt] is not covered.
 func (ps *PromSketches) LookUpAndUpdateWindow(lset labels.Labels, funcName string, mint, maxt int64) bool {
 	series := ps.series.getByHash(lset.Hash(), lset)
 	if series == nil {
@@ -554,7 +597,7 @@ func (ps *PromSketches) LookUpAndUpdateWindow(lset labels.Labels, funcName strin
 				fmt.Println("[lookup] no sketch instance")
 				return false
 			} else if series.sketchInstances.ehuniv.Cover(startt, maxt) == false {
-				// Jika time_window_size < (maxt - mint), update (resize 4x)
+				// If time_window_size < (maxt - mint), grow it (4x)
 				if series.sketchInstances.ehuniv.time_window_size < maxt-mint {
 					fmt.Println("covered time range:", series.sketchInstances.ehuniv.GetMinTime(), series.sketchInstances.ehuniv.GetMaxTime())
 					series.sketchInstances.ehuniv.UpdateWindow(4 * (maxt - mint))
@@ -588,6 +631,243 @@ func (ps *PromSketches) LookUpAndUpdateWindow(lset labels.Labels, funcName strin
 	return true
 }
 
+func matchesBaseLabels(series labels.Labels, base labels.Labels, groupLabel string) bool {
+	if groupLabel != "" && series.Get(groupLabel) == "" {
+		return false
+	}
+	for _, lbl := range base {
+		if groupLabel != "" && lbl.Name == groupLabel {
+			continue
+		}
+		if series.Get(lbl.Name) != lbl.Value {
+			return false
+		}
+	}
+	return true
+}
+
+func (ps *PromSketches) collectSeriesByLabels(base labels.Labels, groupLabel string) []*memSeries {
+	var matched []*memSeries
+	if ps.series == nil || ps.series.size == 0 {
+		return matched
+	}
+	for i := range ps.series.series {
+		ps.series.locks[i].RLock()
+		for _, s := range ps.series.series[i] {
+			if matchesBaseLabels(s.lset, base, groupLabel) {
+				matched = append(matched, s)
+			}
+		}
+		ps.series.locks[i].RUnlock()
+	}
+	return matched
+}
+
+func aggregateSamplingStats(series []*memSeries, mint, maxt int64) (sum, sum2, count float64, hasData bool) {
+	for _, s := range series {
+		if s == nil || s.sketchInstances == nil || s.sketchInstances.sampling == nil {
+			continue
+		}
+		cnt := s.sketchInstances.sampling.QueryCount(mint, maxt)
+		if math.IsNaN(cnt) || cnt <= 0 {
+			continue
+		}
+		sumVal := s.sketchInstances.sampling.QuerySum(mint, maxt)
+		sum2Val := s.sketchInstances.sampling.QuerySum2(mint, maxt)
+		if math.IsNaN(sumVal) || math.IsNaN(sum2Val) {
+			continue
+		}
+		hasData = true
+		count += cnt
+		sum += sumVal
+		sum2 += sum2Val
+	}
+	return
+}
+
+func aggregateUnivStats(series []*memSeries, mint, maxt, cur int64) (aggUniv *UnivSketch, aggMap map[float64]int64, total float64, hasData bool) {
+	for _, s := range series {
+		if s == nil || s.sketchInstances == nil || s.sketchInstances.ehuniv == nil {
+			continue
+		}
+		univ, m, n, _ := s.sketchInstances.ehuniv.QueryIntervalMergeUniv(mint, maxt, cur)
+		if univ == nil && m == nil {
+			continue
+		}
+		hasData = true
+		if univ != nil && m == nil {
+			if aggUniv == nil {
+				aggUniv = univ
+			} else {
+				aggUniv.MergeWith(univ)
+			}
+			continue
+		}
+		if m != nil {
+			if aggMap == nil {
+				aggMap = make(map[float64]int64)
+			}
+			for value, cnt := range *m {
+				aggMap[value] += cnt
+			}
+			total += n
+		}
+	}
+	return
+}
+
+func aggregateKLL(series []*memSeries, mint, maxt int64) (*kll.Sketch, bool) {
+	var merged *kll.Sketch
+	for _, s := range series {
+		if s == nil || s.sketchInstances == nil || s.sketchInstances.ehkll == nil {
+			continue
+		}
+		sk := s.sketchInstances.ehkll.QueryIntervalMergeKLL(mint, maxt)
+		if sk == nil {
+			continue
+		}
+		if merged == nil {
+			merged = sk
+		} else {
+			merged.Merge(sk)
+		}
+	}
+	if merged == nil {
+		return nil, false
+	}
+	return merged, true
+}
+
+func (ps *PromSketches) EvalAggregate(funcName string, base labels.Labels, otherArgs float64, mint, maxt, curTime int64, groupLabel string) (Vector, annotations.Annotations) {
+	matched := ps.collectSeriesByLabels(base, groupLabel)
+	if len(matched) == 0 {
+		return nil, nil
+	}
+
+	switch funcName {
+	case "sum_over_time":
+		sum, _, count, ok := aggregateSamplingStats(matched, mint, maxt)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		_ = count
+		return Vector{Sample{T: curTime, F: sum}}, nil
+	case "sum2_over_time":
+		_, sum2, _, ok := aggregateSamplingStats(matched, mint, maxt)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: sum2}}, nil
+	case "count_over_time", "change_over_time":
+		_, _, count, ok := aggregateSamplingStats(matched, mint, maxt)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: count}}, nil
+	case "avg_over_time":
+		sum, _, count, ok := aggregateSamplingStats(matched, mint, maxt)
+		if !ok || count == 0 {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: sum / count}}, nil
+	case "stdvar_over_time":
+		sum, sum2, count, ok := aggregateSamplingStats(matched, mint, maxt)
+		if !ok || count == 0 {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		mean := sum / count
+		variance := (sum2 / count) - (mean * mean)
+		return Vector{Sample{T: curTime, F: variance}}, nil
+	case "stddev_over_time":
+		sum, sum2, count, ok := aggregateSamplingStats(matched, mint, maxt)
+		if !ok || count == 0 {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		mean := sum / count
+		variance := (sum2 / count) - (mean * mean)
+		if variance < 0 {
+			variance = 0
+		}
+		return Vector{Sample{T: curTime, F: math.Sqrt(variance)}}, nil
+	case "quantile_over_time":
+		merged, ok := aggregateKLL(matched, mint, maxt)
+		if !ok || merged == nil {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		cdf := merged.CDF()
+		val := cdf.Query(otherArgs)
+		return Vector{Sample{T: curTime, F: val}}, nil
+	case "min_over_time":
+		merged, ok := aggregateKLL(matched, mint, maxt)
+		if !ok || merged == nil {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		cdf := merged.CDF()
+		return Vector{Sample{T: curTime, F: cdf.Query(0)}}, nil
+	case "max_over_time":
+		merged, ok := aggregateKLL(matched, mint, maxt)
+		if !ok || merged == nil {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		cdf := merged.CDF()
+		return Vector{Sample{T: curTime, F: cdf.Query(1)}}, nil
+	case "entropy_over_time":
+		aggUniv, aggMap, total, ok := aggregateUnivStats(matched, mint, maxt, curTime)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		if aggMap != nil && total > 0 {
+			mCopy := aggMap
+			return Vector{Sample{T: curTime, F: calc_entropy_map(&mCopy, total)}}, nil
+		}
+		if aggUniv != nil {
+			return Vector{Sample{T: curTime, F: aggUniv.calcEntropy()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+	case "distinct_over_time":
+		aggUniv, aggMap, _, ok := aggregateUnivStats(matched, mint, maxt, curTime)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		if aggMap != nil {
+			mCopy := aggMap
+			return Vector{Sample{T: curTime, F: calc_distinct_map(&mCopy)}}, nil
+		}
+		if aggUniv != nil {
+			return Vector{Sample{T: curTime, F: aggUniv.calcCard()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+	case "l1_over_time":
+		aggUniv, aggMap, _, ok := aggregateUnivStats(matched, mint, maxt, curTime)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		if aggMap != nil {
+			mCopy := aggMap
+			return Vector{Sample{T: curTime, F: calc_l1_map(&mCopy)}}, nil
+		}
+		if aggUniv != nil {
+			return Vector{Sample{T: curTime, F: aggUniv.calcL1()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+	case "l2_over_time":
+		aggUniv, aggMap, _, ok := aggregateUnivStats(matched, mint, maxt, curTime)
+		if !ok {
+			return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+		}
+		if aggMap != nil {
+			mCopy := aggMap
+			return Vector{Sample{T: curTime, F: calc_l2_map(&mCopy)}}, nil
+		}
+		if aggUniv != nil {
+			return Vector{Sample{T: curTime, F: aggUniv.calcL2()}}, nil
+		}
+		return Vector{Sample{T: curTime, F: math.NaN()}}, nil
+	default:
+		return nil, nil
+	}
+}
+
 func (ps *PromSketches) Eval(funcName string, lset labels.Labels, otherArgs float64, mint, maxt, cur_time int64) (Vector, annotations.Annotations) {
 	sfunc := FunctionCalls[funcName]
 	series := ps.series.getByHash(lset.Hash(), lset)
@@ -598,7 +878,7 @@ func (ps *PromSketches) Eval(funcName string, lset labels.Labels, otherArgs floa
 	fmt.Printf("[EVAL] Function: %s, TimeRange: %d → %d\n", funcName, mint, maxt)
 	fmt.Printf("[EVAL] Labels: %s\n", lset.String())
 
-	// Bisa juga log isi sketch: jumlah sampel, min/max waktu
+	// Optionally log sketch contents: sample count and min/max time
 	if series.sketchInstances.sampling != nil {
 		fmt.Printf("[EVAL] Sampling sketch size: %d\n", len(series.sketchInstances.sampling.Arr))
 	}
@@ -630,27 +910,27 @@ func (ps *PromSketches) getOrCreate(hash uint64, lset labels.Labels) (*memSeries
 	return series, true, nil
 }
 
-// GetSketchInstances mengembalikan pointer ke SketchInstances dari memSeries.
+// GetSketchInstances returns a pointer to the SketchInstances for a memSeries.
 func (s *memSeries) GetSketchInstances() *SketchInstances {
 	return s.sketchInstances
 }
 
-// GetOrCreateWrapper adalah fungsi exported yang membungkus getOrCreate internal.
+// GetOrCreateWrapper is the exported helper around the internal getOrCreate.
 func (ps *PromSketches) GetOrCreateWrapper(hash uint64, lset labels.Labels) (*memSeries, bool, error) {
 	return ps.getOrCreate(hash, lset)
 }
 
-// NewSketchInstanceWrapper adalah fungsi exported untuk membuat sketch baru pada memSeries.
+// NewSketchInstanceWrapper is the exported helper to create a new sketch on a memSeries.
 func (ps *PromSketches) NewSketchInstanceWrapper(series *memSeries, stype SketchType, sc *SketchConfig) error {
 	return newSketchInstance(series, stype, sc)
 }
 
 // SketchInsertInsertionThroughputTest will be called in Prometheus scrape module, only for worst-case insertion throughput test
 // t.(int64) is millisecond level timestamp, based on Prometheus timestamp
-// semua jenis sketch diaktifkan sekaligus pada satu time series.
+// all sketch types are enabled at once on a single time series.
 func (ps *PromSketches) SketchInsertInsertionThroughputTest(lset labels.Labels, t int64, val float64) error {
 	t_1 := time.Now()
-	// mencari atau membuat memSeries berdasarkan lset (label)
+	// find or create memSeries based on the label set
 	s, iscreate, _ := ps.getOrCreate(lset.Hash(), lset)
 	if s == nil {
 		return errors.New("memSeries not found")

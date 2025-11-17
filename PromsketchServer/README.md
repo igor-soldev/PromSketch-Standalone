@@ -6,7 +6,7 @@ This document explains how to run the **PromSketch server (Go)**, the **ingester
 
 ## 1) Component Overview
 
-* **Main server (Go, port 7000)**: control & query endpoints (`/parse`, `/health`, `/debug-state`, `/register_config`, `/metrics`).
+* **Main server (Go, port 7000)**: control & query endpoints (`/parse`, `/health`, `/debug-state`, `/register_config`, `/metrics`) plus optional remote write fan‑out.
 * **Per‑partition servers (ports 71xx)**: spawned automatically after registration; expose `/ingest` (JSON ingest) & `/metrics` (per‑port metrics + RAW exposure).
 * **Ingester (Python)**: reads Prometheus‑style `num_samples_config.yml` targets, scrapes each target’s `/metrics`, maps *machineid → port*, then batches POST to `/ingest` on the corresponding 71xx ports.
 * **Demo (Streamlit)**: plots PromSketch vs Prometheus results (time‑series charts per expression), latency, and a simple cost model.
@@ -35,7 +35,7 @@ export MAX_INGEST_GOROUTINES=1024
 go run .
 ```
 
-The server opens control endpoints on **:7000** and pprof on **localhost:6060**. Partition ports **71xx** are created automatically after a `POST /register_config` arrives from the ingester.
+The server opens control endpoints on **:7000** and pprof on **localhost:6060**. Partition ports **71xx** are created automatically after a `POST /register_config` arrives from the ingester. When the remote write forwarder is enabled (default endpoint `http://localhost:9090/api/v1/write`), every ingest payload is also serialized into Prometheus remote write samples and posted asynchronously; set `PROMSKETCH_REMOTE_WRITE_ENDPOINT=""` to disable or point it to any compatible TSDB gateway.
 
 ### B) Prepare the scrape config (minimal example)
 
@@ -67,7 +67,14 @@ Workflow:
 
 ### D) (Optional) Run Prometheus for comparison
 
-Run Prometheus on `http://localhost:9090`. You can also let Prometheus scrape the per‑port RAW endpoints `:71xx/metrics` via a `promsketch_raw_groups` job if you want to monitor partition‑level ingest.
+Run Prometheus on `http://localhost:9090`. You can also let Prometheus scrape the per‑port RAW endpoints `:71xx/metrics` via a `promsketch_raw_groups` job if you want to monitor partition‑level ingest. To accept PromSketch remote write traffic locally, start Prometheus with the remote write receiver feature enabled:
+
+```bash
+./prometheus \
+  --config.file=documentation/examples/prometheus.yml \
+  --enable-feature=remote-write-receiver \
+  --web.enable-lifecycle
+```
 
 ### E) Run the demo (Streamlit)
 
@@ -80,6 +87,23 @@ In the UI you’ll see:
 * **Latency** charts (local Prometheus, local PromSketch, server PromSketch).
 * **Metric value** charts for each expression.
 * **Cost panel** estimated insert/query/storage costs driven by Prometheus & PromSketch counters.
+
+---
+
+### 5. (Optional) Enable Remote Write Forwarding
+
+PromSketch can mirror every ingest batch to a Prometheus-compatible remote write endpoint (for example, a long-term storage cluster).
+
+1. Set the following environment variables before launching `go run .` in `ProsmketchServer/`:
+
+   ```bash
+   export PROMSKETCH_REMOTE_WRITE_ENDPOINT="http://your-remote-write-host/api/v1/write"
+   export PROMSKETCH_REMOTE_WRITE_TIMEOUT="15s"   # optional, defaults to 5s
+   ```
+
+2. When these are set, the server streams each `IngestPayload` to the endpoint via `remote_write.go`, preserving label sets and enforcing monotonic timestamps.
+
+If the endpoint becomes unavailable, payloads are dropped with a warning so that ingestion latency is not impacted.
 
 ---
 
@@ -166,6 +190,7 @@ Example **rules** file for batch queries (optional): `promsketch-rules.yml` also
 * **Concurrency**: `MAX_INGEST_GOROUTINES` (env var), default 1024.
 * **Port partitioning**: defaults `startPort=7100`, `machinesPerPort=200`; can be overridden via `POST /register_config`.
 * **Prometheus auto‑update (optional)**: `UpdatePrometheusYML(path)` can inject a `promsketch_raw_groups` job with active 71xx ports.
+* **Remote write forwarding**: `PROMSKETCH_REMOTE_WRITE_ENDPOINT` (default `http://localhost:9090/api/v1/write`) controls the target; set it to an empty string to skip forwarding. `PROMSKETCH_REMOTE_WRITE_TIMEOUT` accepts Go durations (e.g., `5s`, `1m`) for delivery timeouts. The server deduplicates payloads, enforces monotonic timestamps per series, and pushes samples asynchronously so ingest latency stays unaffected.
 * **Logging & CSV**:
 
   * *Throughput*: `throughput_log.csv` (samples/sec, total samples).

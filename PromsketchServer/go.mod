@@ -10,10 +10,12 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/gin-gonic/gin v1.10.1
 	github.com/gogo/protobuf v1.3.2
+	github.com/golang/snappy v0.0.4
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc
 	github.com/klauspost/compress v1.18.0
 	github.com/prometheus/client_golang v1.22.0
 	github.com/prometheus/common v0.65.0
+	github.com/prometheus/prometheus v0.54.1
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.10.0
 	github.com/zzylol/VictoriaMetrics-sketches v0.1.0
@@ -60,7 +62,6 @@ require (
 	github.com/go-playground/validator/v10 v10.20.0 // indirect
 	github.com/goccy/go-json v0.10.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
-	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect

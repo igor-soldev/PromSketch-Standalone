@@ -223,7 +223,7 @@ func (ehu *ExpoHistogramUnivOptimized) calc_l22(eh_arr_bucket *EHMap) float64 {
 	return l2
 }
 
-// Memasukkan nilai baru fvalue pada waktu time_ ke dalam histogram
+// Insert a new fvalue at time_ into the histogram
 func (ehu *ExpoHistogramUnivOptimized) Update(time_ int64, fvalue float64) {
 
 	// ehu.print_buckets()

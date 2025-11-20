@@ -310,22 +310,22 @@ func funcL2OverTime(ctx context.Context, series *memSeries, c float64, t1, t2, t
 
 func funcQuantileOverTime(ctx context.Context, series *memSeries, otherArgs float64, t1, t2, cur_time int64) Vector {
 	if series == nil || series.sketchInstances == nil || series.sketchInstances.ehkll == nil {
-		// Log atau tangani jika tidak ada instance EHKLL yang relevan
+		// Log or handle when no relevant EHKLL instance is available
 		fmt.Println("No EHKLL sketch instance found for quantile query.")
-		return Vector{Sample{F: math.NaN()}} // Mengembalikan NaN jika sketch tidak ada
+		return Vector{Sample{F: math.NaN()}} // Return NaN when the sketch is missing
 	}
 
 	merged_kll := series.sketchInstances.ehkll.QueryIntervalMergeKLL(t1, t2)
 
-	if merged_kll == nil { // <--- TAMBAHKAN PEMERIKSAAN NIL INI
-		// Jika tidak ada data dalam rentang waktu, atau QueryIntervalMergeKLL mengembalikan nil
+	if merged_kll == nil {
+		// No data in the time range, or QueryIntervalMergeKLL returned nil
 		fmt.Println("Merged KLL sketch is nil for quantile query.")
-		return Vector{Sample{F: math.NaN()}} // Mengembalikan NaN
+		return Vector{Sample{F: math.NaN()}} // Return NaN
 	}
 
 	fmt.Println("quantile=", otherArgs)
-	// Sekarang panggil CDF dengan aman
-	cdf := merged_kll.CDF() // <--- Panic terjadi di sini sebelumnya
+	// Now call CDF safely
+	cdf := merged_kll.CDF()
 	q := cdf.Query(otherArgs)
 
 	qmin := cdf.Query(0)

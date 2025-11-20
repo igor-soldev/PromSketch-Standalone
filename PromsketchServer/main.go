@@ -417,12 +417,10 @@ func UpdatePrometheusYML(path string) error {
 			newLines = append(newLines, line)
 			if strings.HasPrefix(strings.TrimSpace(line), "scrape_configs:") && !inserted {
 				inserted = true
-				// cari indentasi
 				for j := i + 1; j < len(lines); j++ {
 					if strings.HasPrefix(lines[j], "  - job_name:") || strings.TrimSpace(lines[j]) == "" {
 						continue
 					}
-					// sisipkan di sini
 					newLines = append(newLines, scrapeSection...)
 					break
 				}

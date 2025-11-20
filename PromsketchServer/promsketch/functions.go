@@ -169,9 +169,9 @@ func funcSumOverTime(ctx context.Context, series *memSeries, c float64, t1, t2, 
 // 	s := series.sketchInstances.sampling
 // 	var v float64
 // 	if PrometheusMode {
-// 		v = s.QuerySumBuckets(t1, t2) // per-bucket (tanpa 1/p)
+// 		v = s.QuerySumBuckets(t1, t2)
 // 	} else {
-// 		v = s.QuerySum(t1, t2) // estimator event-level (dengan 1/p)
+// 		v = s.QuerySum(t1, t2)
 // 	}
 // 	return Vector{Sample{F: v}}
 // }
@@ -208,9 +208,9 @@ func funcCountOverTime(ctx context.Context, series *memSeries, c float64, t1, t2
 // 	s := series.sketchInstances.sampling
 // 	var v float64
 // 	if PrometheusMode {
-// 		v = s.QueryCountBuckets(t1, t2) // per-bucket (tanpa 1/p)
+// 		v = s.QueryCountBuckets(t1, t2)
 // 	} else {
-// 		v = s.QueryCount(t1, t2) // estimator event-level (dengan 1/p)
+// 		v = s.QueryCount(t1, t2)
 // 	}
 // 	return Vector{Sample{F: v}}
 // }

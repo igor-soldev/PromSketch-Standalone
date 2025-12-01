@@ -107,10 +107,10 @@ Ensure that the `prometheus.yml` path points to the file rewritten by the server
 
 #### 4. Run PromTools for Query Testing
 
-Run PromTools from `ProsmketchServer/` to continuously send PromQL queries:
+Run PromTools from `PromsketchServer/` to continuously send PromQL queries:
 
 ```bash
-cd ProsmketchServer/
+cd PromsketchServer/
 
 python3 promtools.py
 ```
@@ -152,6 +152,7 @@ You can benchmark ingestion and query execution as follows:
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 
 

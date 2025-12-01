@@ -30,7 +30,7 @@ This repository contains the implementation of standalone **PromSketch**, a sket
 
 ### Components
 
-* **Main Server**
+* **Main PromSketch Server**
   Path: `PromsketchServer/main.go`
   Handles ingestion, sketch storage, and PromQL query execution. Runs on **localhost:7000** by default.
 
@@ -50,10 +50,26 @@ This repository contains the implementation of standalone **PromSketch**, a sket
 
 ### Step-by-Step Running Instructions
 
-#### 1. Start the Export Manager and Custom Ingester
+#### 1. Launch the Main PromSketch Server
+
+From `PromsketchServer/`, run:
+
+```bash
+cd PromsketchServer/
+
+MAX_INGEST_GOROUTINES=n go run .
+```
+
+* `MAX_INGEST_GOROUTINES` controls concurrency for ingestion.
+* On startup, the server **automatically rewrites `prometheus.yml`** based on the number of multiport ingestion endpoints.
+
+---
+
+#### 2. Start the Export Manager and Custom Ingester
 
 Inside `ExporterStarter/`, run the following to generate and ingest synthetic data:
 
+In one terminal:
 ```bash
 cd ExporterStarter/
 
@@ -67,27 +83,13 @@ python3 ExportManager.py \
   --waiteval=60
 ```
 
+In another terminal: 
 ```bash
 cd ExporterStarter/
 
 # Start Custom Ingester
 python3 custom_ingester.py --config=num_samples_config.yml
 ```
-
----
-
-#### 2. Launch the Main PromSketch Server
-
-From `PromsketchServer/`, run:
-
-```bash
-cd PromsketchServer/
-
-MAX_INGEST_GOROUTINES=n go run .
-```
-
-* `MAX_INGEST_GOROUTINES` controls concurrency for ingestion.
-* On startup, the server **automatically rewrites `prometheus.yml`** based on the number of multiport ingestion endpoints.
 
 ---
 
@@ -163,6 +165,7 @@ You can benchmark ingestion and query execution as follows:
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 
 

@@ -65,6 +65,10 @@ python3 ExportManager.py \
   --max_windowsize=100000 \
   --querytype=entropy \
   --waiteval=60
+```
+
+```bash
+cd ExporterStarter/
 
 # Start Custom Ingester
 python3 custom_ingester.py --config=num_samples_config.yml
@@ -148,6 +152,7 @@ You can benchmark ingestion and query execution as follows:
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 
 

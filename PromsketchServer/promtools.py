@@ -146,7 +146,7 @@ def query_promsketch(query_str):
 
         if response.status_code == 202:
             message = response.json().get("message")
-            print(f"[PROMSKETCH] Sketch belum siap: {message}")
+            print(f"[PROMSKETCH] Sketch is not ready yet: {message}")
             return float("nan"), local_latency_ms, None, float("nan"), None, 0
 
         print(f"[PROMSKETCH] HTTP {response.status_code}: {response.text}")
@@ -265,7 +265,7 @@ def push_result_to_server(
     try:
         requests.post(RESULT_PUSH_URL, json=body, timeout=5)
     except Exception as exc:
-        print(f"[WARN] Gagal push hasil ke server: {exc}")
+        print(f"[WARN] Failed to push results to server: {exc}")
 
 # Handle Ctrl+C so the loop exits cleanly.
 def signal_handler(sig, frame):

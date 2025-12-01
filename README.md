@@ -96,7 +96,7 @@ MAX_INGEST_GOROUTINES=n go run .
 From the Prometheus build directory:
 
 ```bash
-cd ProsmketchServer/prometheus/
+cd PromsketchServer/prometheus/
 
 ./prometheus --config.file=documentation/examples/prometheus.yml   --enable-feature=remote-write-receiver --web.enable-lifecycle
 ```
@@ -152,6 +152,7 @@ You can benchmark ingestion and query execution as follows:
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 
 

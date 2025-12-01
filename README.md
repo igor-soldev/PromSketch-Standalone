@@ -98,7 +98,7 @@ From the Prometheus build directory:
 ```bash
 cd PromsketchServer/prometheus/ # download prometheus and compile here
 
-./prometheus --config.file=documentation/examples/prometheus.yml   --enable-feature=remote-write-receiver --web.enable-lifecycle
+./prometheus --config.file=../prometheus-config/prometheus.yml   --enable-feature=remote-write-receiver --web.enable-lifecycle
 ```
 
 Ensure that the `prometheus.yml` path points to the file rewritten by the server.
@@ -111,7 +111,7 @@ git submodule update --init --recursive
 
 cd PromsketchServer/external/prometheus-sketch-VLDB/prometheus-extended/prometheus
 make build
-./prometheus --config.file=../../../../../documentation/examples/prometheus.yml   --enable-feature=remote-write-receiver --web.enable-lifecycle
+./prometheus --config.file=../../../../prometheus-config/prometheus.yml   --enable-feature=remote-write-receiver --web.enable-lifecycle
 ```
 
 ---
@@ -163,6 +163,7 @@ You can benchmark ingestion and query execution as follows:
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 
 

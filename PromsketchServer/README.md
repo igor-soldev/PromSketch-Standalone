@@ -231,8 +231,6 @@ rules:
     query: stdvar_over_time(fake_machine_metric{machineid="machine_0"}[10000s])
   - name: "Sum over time"
     query: sum_over_time(fake_machine_metric{machineid="machine_0"}[10000s])
-  - name: "Sum squared over time"
-    query: sum2_over_time(fake_machine_metric{machineid="machine_0"}[10000s])
   - name: "Distinct over time"
     query: distinct_over_time(fake_machine_metric{machineid="machine_0"}[10000s])
   - name: "L1 norm over time"

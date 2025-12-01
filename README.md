@@ -31,7 +31,7 @@ This repository contains the implementation of standalone **PromSketch**, a sket
 ### Components
 
 * **Main Server**
-  Path: `ProsmketchServer/main.go`
+  Path: `PromsketchServer/main.go`
   Handles ingestion, sketch storage, and PromQL query execution. Runs on **localhost:7000** by default.
 
 * **Custom Ingester**
@@ -148,6 +148,7 @@ You can benchmark ingestion and query execution as follows:
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
 
 ---
+
 
 
 

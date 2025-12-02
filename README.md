@@ -43,7 +43,7 @@ This repository contains the implementation of standalone **PromSketch**, a sket
   Generates synthetic time series data for ingestion tests.
 
 * **PromTools** (`PromsketchServer/promtools.py`)
-  Issues PromQL queries to the PromSketch server at fixed intervals (default: every 5 seconds).
+  Issues PromQL queries to both the PromSketch server and a Prometheus server at fixed intervals (default: every 5 seconds) for side-by-side comparison.
 
 ### Remote write: enable/disable and where to configure
 
@@ -54,12 +54,6 @@ This repository contains the implementation of standalone **PromSketch**, a sket
 * Point to another TSDB/gateway: set `PROMSKETCH_REMOTE_WRITE_ENDPOINT="http://your-host:port/api/v1/write"` and optionally tune `PROMSKETCH_REMOTE_WRITE_TIMEOUT` (Go duration, e.g., `5s`, `1m`) to bound delivery latency (`PromsketchServer/main.go:198-207`).
 * Delivery path: payloads accepted by `/ingest` are forwarded asynchronously so ingest latency is unaffected (`PromsketchServer/main.go:645-690`). The background worker that serializes and posts the remote write request lives in `PromsketchServer/remote_write.go:25-91`.
 * Safety notes: timestamps are made monotonic per series and backpressure is applied with a bounded queue; check the log prefix `[REMOTE WRITE]` to confirm deliveries (`PromsketchServer/remote_write.go:39-91`).
-
-### Remote write vs scraping ports 71xx
-
-* **Remote write fan-out** pushes every ingested sample to a single remote-write endpoint for long-term/backup TSDBs. It runs asynchronously (no extra ingest latency) and requires the receiver feature on the target Prometheus/TSDB. Best when you need full-fidelity copies of ingest.
-* **Scraping ports 71xx** has Prometheus pull `:71xx/metrics` via the `promsketch_raw_groups` job (see `PromsketchServer/prometheus-config/prometheus.yml` and the auto-generated section from `UpdatePrometheusYML` in `PromsketchServer/main.go:214-274`). Those endpoints expose per-partition gauges plus RAW replicas of the latest ingested values (`PromsketchServer/main.go:720-763`), which is ideal for monitoring partition health and quick dashboards.
-* **When to choose**: use remote write for durable, sample-for-sample replication; use 71xx scraping to observe partition throughput/last values or when you cannot enable remote write on the TSDB. You can also run both: remote write for storage plus 71xx scraping for ops visibility.
 
 ### Configuration files (ingester & Prometheus)
 
@@ -97,6 +91,9 @@ From `PromsketchServer/`, run:
 cd PromsketchServer/
 
 MAX_INGEST_GOROUTINES=n go run .
+
+# or use defaults (MAX_INGEST_GOROUTINES=1024)
+go run .
 ```
 
 * `MAX_INGEST_GOROUTINES` controls concurrency for ingestion.

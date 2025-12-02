@@ -1170,7 +1170,6 @@ func handleParse(c *gin.Context) {
 	respAnn["prometheus_sample_count"] = promCount
 	respAnn["promsketch_sample_count"] = pskCount
 
-	// Kirim response ke client
 	c.JSON(http.StatusOK, response)
 
 	// END STAGE 3: record result_sort / encode time

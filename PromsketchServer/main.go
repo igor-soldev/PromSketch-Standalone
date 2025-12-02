@@ -191,8 +191,8 @@ func init() {
 		log.Printf("[CONFIG] Query endpoint disabled (%s)", source)
 	}
 	endpoint := strings.TrimSpace(defaults.remoteWriteEndpoint)
-	if envEndpoint := strings.TrimSpace(os.Getenv("PROMSKETCH_REMOTE_WRITE_ENDPOINT")); envEndpoint != "" {
-		endpoint = envEndpoint
+	if rawEnvEndpoint, ok := os.LookupEnv("PROMSKETCH_REMOTE_WRITE_ENDPOINT"); ok {
+		endpoint = strings.TrimSpace(rawEnvEndpoint) // empty string disables remote write
 	}
 	if endpoint != "" {
 		timeout := defaults.remoteWriteTimeout

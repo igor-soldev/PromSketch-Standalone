@@ -1,113 +1,10 @@
-# PromSketch Demo & Server — Usage & Configuration Guide
+# PromSketch Server — Configuration & Reference
 
-This document explains how to run the **PromSketch server (Go)**, the **ingester (Python)**, and the **demo (Streamlit)**, lists the **query expressions** used by the demo, and summarizes the **configurable parameters** you can tweak.
-
----
-
-## 1) Component Overview
-
-* **Main server (Go, port 7000)**: control & query endpoints (`/parse`, `/health`, `/debug-state`, `/register_config`, `/metrics`) plus optional remote write fan‑out.
-* **Per‑partition servers (ports 71xx)**: spawned automatically after registration; expose `/ingest` (JSON ingest) & `/metrics` (per‑port metrics + RAW exposure).
-* **Ingester (Python)**: reads Prometheus‑style `num_samples_config.yml` targets, scrapes each target’s `/metrics`, maps *machineid → port*, then batches POST to `/ingest` on the corresponding 71xx ports.
-* **Demo (Streamlit)**: plots PromSketch vs Prometheus results (time‑series charts per expression), latency, and a simple cost model.
-
-High‑level flow: **exporters → ingester → ports 71xx (/ingest) → sketches in server → /parse → demo**.
+This document focuses on the server-side configuration, especially where to place the YAML configs and how they connect to `prometheus-config`. Run/workflow guidance and UI walkthroughs now live in the **root README**.
 
 ---
 
-## 2) Prerequisites
-
-* Go ≥ 1.25 (to run the server).
-* Python ≥ 3.10 with: `aiohttp`, `pyyaml`, `prometheus_client`, `streamlit`, `pandas`, `requests`.
-* (Optional) Prometheus running at `http://localhost:9090` for side‑by‑side comparisons.
-
----
-
-## 3) Quick Start
-
-### A) Run the Go server (port 7000)
-
-```bash
-cd PromsketchServer
-# optional: adjust ingest concurrency
-export MAX_INGEST_GOROUTINES=1024
-# run the server
-go run .
-```
-
-The server opens control endpoints on **:7000** and pprof on **localhost:6060**. Partition ports **71xx** are created automatically after a `POST /register_config` arrives from the ingester. When the remote write forwarder is enabled (default endpoint `http://localhost:9090/api/v1/write`), every ingest payload is also serialized into Prometheus remote write samples and posted asynchronously; set `PROMSKETCH_REMOTE_WRITE_ENDPOINT=""` to disable or point it to any compatible TSDB gateway.
-
-### B) Prepare the scrape config (minimal example)
-
-Create `num_samples_config.yml`:
-
-```yaml
-scrape_configs:
-  - job_name: fake-exporter
-    scrape_interval: 1s
-    static_configs:
-      - targets: ["localhost:8000", "localhost:8001"]
-```
-
-> Make sure each target exposes Prometheus metrics and attaches a `machineid` label to samples you intend to forward.
-
-### C) Run the ingester (Python)
-
-```bash
-python custom_ingester.py --config num_samples_config.yml
-```
-
-Workflow:
-
-1. Read `targets` from YAML.
-2. `POST /register_config` to **:7000** with capacity hints (e.g., `estimated_timeseries`) to determine how many **71xx** ports to spawn.
-3. Scrape each target’s `/metrics`, parse into samples `(name, labels, value)`.
-4. Map **machineid → 71xx port** (ranges are based on `MACHINES_PER_PORT`).
-5. Batch POST to `http://localhost:71xx/ingest` at a fixed interval.
-
-### D) (Optional) Run Prometheus for comparison
-
-Run Prometheus on `http://localhost:9090`. You can also let Prometheus scrape the per‑port RAW endpoints `:71xx/metrics` via a `promsketch_raw_groups` job if you want to monitor partition‑level ingest. To accept PromSketch remote write traffic locally, start Prometheus with the remote write receiver feature enabled:
-
-```bash
-./prometheus \
-  --config.file=documentation/examples/prometheus.yml \
-  --enable-feature=remote-write-receiver \
-  --web.enable-lifecycle
-```
-
-### E) Run the demo (Streamlit)
-
-```bash
-streamlit run demo.py
-```
-
-In the UI you’ll see:
-
-* **Latency** charts (local Prometheus, local PromSketch, server PromSketch).
-* **Metric value** charts for each expression.
-* **Cost panel** estimated insert/query/storage costs driven by Prometheus & PromSketch counters.
-
----
-
-### 5. (Optional) Enable Remote Write Forwarding
-
-PromSketch can mirror every ingest batch to a Prometheus-compatible remote write endpoint (for example, a long-term storage cluster).
-
-1. Set the following environment variables before launching `go run .` in `ProsmketchServer/`:
-
-   ```bash
-   export PROMSKETCH_REMOTE_WRITE_ENDPOINT="http://your-remote-write-host/api/v1/write"
-   export PROMSKETCH_REMOTE_WRITE_TIMEOUT="15s"   # optional, defaults to 5s
-   ```
-
-2. When these are set, the server streams each `IngestPayload` to the endpoint via `remote_write.go`, preserving label sets and enforcing monotonic timestamps.
-
-If the endpoint becomes unavailable, payloads are dropped with a warning so that ingestion latency is not impacted.
-
----
-
-## 4) Endpoints & Payloads
+## 1) Endpoints & Payloads
 
 ### Main server endpoints (:7000)
 
@@ -146,7 +43,7 @@ echo "$(curl -s 'http://localhost:7000/parse?q=sum_over_time(fake_machine_metric
 
 ---
 
-## 5) Built‑in Query Expressions
+## 2) Built‑in Query Expressions
 
 General pattern: `func(metric{label="..."}[window])`.
 
@@ -164,7 +61,7 @@ Example **rules** file for batch queries (optional): `promsketch-rules.yml` also
 
 ---
 
-## 6) What You Can Configure
+## 3) What You Can Configure
 
 ### a) Demo (Streamlit) — `demo.py`
 
@@ -200,7 +97,7 @@ Example **rules** file for batch queries (optional): `promsketch-rules.yml` also
 
 ---
 
-## 7) Tips & Troubleshooting
+## 4) Tips & Troubleshooting
 
 * Ensure the `machineid` label exists on samples you want to partition; otherwise everything may fall back to a default mapping.
 * Never send ingest to **7000** (control); use the spawned **71xx** ports.
@@ -209,7 +106,7 @@ Example **rules** file for batch queries (optional): `promsketch-rules.yml` also
 
 ---
 
-## 8) Appendix
+## 5) Appendix
 
 ### Example `promsketch-rules.yml`
 

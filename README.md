@@ -45,42 +45,6 @@ This repository contains the implementation of standalone **PromSketch**, a sket
 * **PromTools** (`PromsketchServer/promtools.py`)
   Issues PromQL queries to both the PromSketch server and a Prometheus server at fixed intervals (default: every 5 seconds) for side-by-side comparison.
 
-### Remote write: enable/disable and where to configure
-
-* Default state: remote write is **enabled** and targets `http://localhost:9090/api/v1/write` (`PromsketchServer/main.go:193-208`). The writer is only created when the endpoint string is non-empty.
-* Disable options:
-  - Env-only toggle: export `PROMSKETCH_REMOTE_WRITE_ENDPOINT=""` before starting the server to skip forwarding while keeping local sketch ingestion intact.
-  - Default-off build: set `remoteWriteEndpoint: ""` in `defaults` inside `PromsketchServer/main.go` (around lines `80-85`), rebuild, and the writer will remain disabled unless you pass a non-empty env var.
-* Point to another TSDB/gateway: set `PROMSKETCH_REMOTE_WRITE_ENDPOINT="http://your-host:port/api/v1/write"` and optionally tune `PROMSKETCH_REMOTE_WRITE_TIMEOUT` (Go duration, e.g., `5s`, `1m`) to bound delivery latency (`PromsketchServer/main.go:198-207`).
-* Delivery path: payloads accepted by `/ingest` are forwarded asynchronously so ingest latency is unaffected (`PromsketchServer/main.go:645-690`). The background worker that serializes and posts the remote write request lives in `PromsketchServer/remote_write.go:25-91`.
-* Safety notes: timestamps are made monotonic per series and backpressure is applied with a bounded queue; check the log prefix `[REMOTE WRITE]` to confirm deliveries (`PromsketchServer/remote_write.go:39-91`).
-
-### Configuration files (ingester & Prometheus)
-
-* **Ingestion/scrape config** (`config.yaml` or `num_samples_config.yml`)
-  - Location: place alongside the ingester (commonly `ExporterStarter/`) and pass via `--config`.
-  - Structure: Prometheus-style `scrape_configs` with `targets`, `scrape_interval`, and labels; ensure every target emits a `machineid` label for sharding.
-  - Example:
-    ```yaml
-    scrape_configs:
-      - job_name: fake-exporter
-        scrape_interval: 1s
-        static_configs:
-          - targets: ["localhost:8000", "localhost:8001"]
-    ```
-  - Purpose: drives `POST /register_config` capacity hints and how many 71xx ingest ports the server spawns.
-
-* **Prometheus config** (`PromsketchServer/prometheus-config/prometheus.yml`)
-  - Use this when running Prometheus alongside PromSketch—either to scrape partition RAW endpoints (`promsketch_raw_groups`) or to accept remote write.
-  - The server’s `UpdatePrometheusYML` helper rewrites this file with active 71xx ports; keep Prometheus pointed to this path.
-  - Rule files in the same folder: `prometheus-rules.yml`, `promsketch-latency.yml`.
-
-* **Prep tips**
-  - Ensure `machineid` exists on exporter samples for correct partition routing.
-  - Tune `scrape_interval` to workload rate and size `targets` appropriately.
-
----
-
 ### Step-by-Step Running Instructions
 
 #### 1. Launch the Main PromSketch Server
@@ -223,6 +187,47 @@ You can benchmark ingestion and query execution as follows:
 
 * **Multiport ingestion endpoints** handle raw data ingestion and forward metrics directly to Prometheus.
 * **Main server (7000)** is responsible for sketch aggregation and query execution. It must be active for queries to run.
+
+---
+
+
+
+
+
+
+### Remote write: enable/disable and where to configure
+
+* Default state: remote write is **enabled** and targets `http://localhost:9090/api/v1/write` (`PromsketchServer/main.go:193-208`). The writer is only created when the endpoint string is non-empty.
+* Disable options:
+  - Env-only toggle: export `PROMSKETCH_REMOTE_WRITE_ENDPOINT=""` before starting the server to skip forwarding while keeping local sketch ingestion intact.
+  - Default-off build: set `remoteWriteEndpoint: ""` in `defaults` inside `PromsketchServer/main.go` (around lines `80-85`), rebuild, and the writer will remain disabled unless you pass a non-empty env var.
+* Point to another TSDB/gateway: set `PROMSKETCH_REMOTE_WRITE_ENDPOINT="http://your-host:port/api/v1/write"` and optionally tune `PROMSKETCH_REMOTE_WRITE_TIMEOUT` (Go duration, e.g., `5s`, `1m`) to bound delivery latency (`PromsketchServer/main.go:198-207`).
+* Delivery path: payloads accepted by `/ingest` are forwarded asynchronously so ingest latency is unaffected (`PromsketchServer/main.go:645-690`). The background worker that serializes and posts the remote write request lives in `PromsketchServer/remote_write.go:25-91`.
+* Safety notes: timestamps are made monotonic per series and backpressure is applied with a bounded queue; check the log prefix `[REMOTE WRITE]` to confirm deliveries (`PromsketchServer/remote_write.go:39-91`).
+
+### Configuration files (ingester & Prometheus)
+
+* **Ingestion/scrape config** (`config.yaml` or `num_samples_config.yml`)
+  - Location: place alongside the ingester (commonly `ExporterStarter/`) and pass via `--config`.
+  - Structure: Prometheus-style `scrape_configs` with `targets`, `scrape_interval`, and labels; ensure every target emits a `machineid` label for sharding.
+  - Example:
+    ```yaml
+    scrape_configs:
+      - job_name: fake-exporter
+        scrape_interval: 1s
+        static_configs:
+          - targets: ["localhost:8000", "localhost:8001"]
+    ```
+  - Purpose: drives `POST /register_config` capacity hints and how many 71xx ingest ports the server spawns.
+
+* **Prometheus config** (`PromsketchServer/prometheus-config/prometheus.yml`)
+  - Use this when running Prometheus alongside PromSketch—either to scrape partition RAW endpoints (`promsketch_raw_groups`) or to accept remote write.
+  - The server’s `UpdatePrometheusYML` helper rewrites this file with active 71xx ports; keep Prometheus pointed to this path.
+  - Rule files in the same folder: `prometheus-rules.yml`, `promsketch-latency.yml`.
+
+* **Prep tips**
+  - Ensure `machineid` exists on exporter samples for correct partition routing.
+  - Tune `scrape_interval` to workload rate and size `targets` appropriately.
 
 ---
 
